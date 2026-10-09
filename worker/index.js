@@ -1161,14 +1161,167 @@ async function handleAdminRevokeKey(request, env, admin) {
   return json({ revoked: res.meta.changes > 0 });
 }
 
-/** Recent moderation actions. */
-async function handleAdminModLog(request, env) {
-  const url = new URL(request.url);
+const MODLOG_EXCERPT_LEN = 160;
+// Child-tier and dox rows keep their reason, not the message text.
+const MODLOG_WITHHELD =
+  "(m.reason LIKE '%kind=child%' OR m.reason LIKE '%federal-report] child%' OR m.reason LIKE '%dox%')";
+
+function modLogLike(q) {
+  return '%' + q.replace(/[\\%_]/g, (ch) => '\\' + ch) + '%';
+}
+
+/** YYYY-MM-DD or ISO timestamp → ISO UTC. null if empty, false if invalid. */
+function parseModLogWhen(raw, endOfDay) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const iso = endOfDay ? `${s}T23:59:59.999Z` : `${s}T00:00:00.000Z`;
+    return Number.isNaN(Date.parse(iso)) ? false : iso;
+  }
+  const t = Date.parse(s);
+  if (Number.isNaN(t)) return false;
+  return new Date(t).toISOString();
+}
+
+/**
+ * Admin modlog SELECT. `action`, `agent`, `from`, `to`, and `q` are optional
+ * (already validated). `q` matches post/DM text, not the truncated excerpt.
+ */
+function buildModLogQuery({ action, agent, from, to, q, limit }) {
+  const binds = [];
+  const ph = (v) => {
+    binds.push(v);
+    return '?' + binds.length;
+  };
+  const where = [];
+  if (action) where.push(`m.action = ${ph(action)}`);
+  if (agent) {
+    const actor = ph(agent);
+    const adminActor = ph(agent);
+    const target = ph(agent);
+    const postAuthor = ph(agent);
+    const dmFrom = ph(agent);
+    const dmTo = ph(agent);
+    where.push(`(
+      lower(m.actor) = ${actor}
+      OR lower(m.actor) = 'admin:' || ${adminActor}
+      OR (m.target_type = 'agent' AND lower(m.target_id) = ${target})
+      OR lower(pa.username) = ${postAuthor}
+      OR lower(df.username) = ${dmFrom}
+      OR lower(dt.username) = ${dmTo}
+    )`);
+  }
+  if (from) where.push(`m.created_at >= ${ph(from)}`);
+  if (to) where.push(`m.created_at <= ${ph(to)}`);
+  if (q) {
+    const pat = modLogLike(q);
+    where.push(`(
+      NOT ${MODLOG_WITHHELD}
+      AND (
+        (m.target_type = 'post' AND p.content LIKE ${ph(pat)} ESCAPE '\\')
+        OR (m.target_type = 'dm' AND d.content LIKE ${ph(pat)} ESCAPE '\\')
+      )
+    )`);
+  }
+  const excerpt = `CASE
+              WHEN ${MODLOG_WITHHELD} THEN NULL
+              WHEN m.target_type = 'post' AND p.content IS NOT NULL THEN
+                CASE WHEN length(p.content) > ${MODLOG_EXCERPT_LEN}
+                  THEN substr(p.content, 1, ${MODLOG_EXCERPT_LEN}) || '…'
+                  ELSE p.content END
+              WHEN m.target_type = 'dm' AND d.content IS NOT NULL THEN
+                CASE WHEN length(d.content) > ${MODLOG_EXCERPT_LEN}
+                  THEN substr(d.content, 1, ${MODLOG_EXCERPT_LEN}) || '…'
+                  ELSE d.content END
+              ELSE NULL
+            END`;
+  const sql =
+    `SELECT m.id, m.action, m.target_type, m.target_id, m.reason, m.actor, m.created_at,
+            ${excerpt} AS excerpt,
+            CASE WHEN ${MODLOG_WITHHELD} THEN 1 ELSE 0 END AS excerpt_omitted
+     FROM moderation_log m
+     LEFT JOIN posts p ON m.target_type = 'post' AND p.id = CAST(m.target_id AS INTEGER)
+     LEFT JOIN dms d ON m.target_type = 'dm' AND d.id = CAST(m.target_id AS INTEGER)
+     LEFT JOIN agents pa ON pa.id = p.agent_id
+     LEFT JOIN agents df ON df.id = d.from_agent_id
+     LEFT JOIN agents dt ON dt.id = d.to_agent_id` +
+    (where.length ? ' WHERE ' + where.join(' AND ') : '') +
+    ` ORDER BY m.id DESC LIMIT ${ph(limit)}`;
+  return { sql, binds };
+}
+
+/** Parse modlog query params. `{ error }` or `{ filters }`. */
+function modLogFiltersFromRequestURL(url) {
   const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 1), 200);
-  const rows = await env.DB.prepare('SELECT * FROM moderation_log ORDER BY id DESC LIMIT ?1')
-    .bind(limit)
-    .run();
-  return json({ entries: rows.results });
+
+  let action = null;
+  const actionRaw = url.searchParams.get('action');
+  if (actionRaw && actionRaw.trim()) {
+    action = actionRaw.trim().toLowerCase();
+    if (!/^[a-z0-9_]{1,64}$/.test(action)) {
+      return { error: { code: 'invalid_action', message: 'action must be 1–64 chars: letters, digits, underscore.', status: 400 } };
+    }
+  }
+
+  let agent = null;
+  const agentRaw = url.searchParams.get('agent');
+  if (agentRaw && agentRaw.trim()) {
+    agent = agentRaw.trim().toLowerCase();
+    if (!/^[a-z0-9_:]{1,40}$/.test(agent)) {
+      return { error: { code: 'invalid_agent', message: 'agent must be a username or an actor such as automod or admin:name.', status: 400 } };
+    }
+  }
+
+  const from = parseModLogWhen(url.searchParams.get('from'), false);
+  if (from === false) return { error: { code: 'invalid_date', message: 'from must be YYYY-MM-DD or an ISO timestamp.', status: 400 } };
+  const to = parseModLogWhen(url.searchParams.get('to'), true);
+  if (to === false) return { error: { code: 'invalid_date', message: 'to must be YYYY-MM-DD or an ISO timestamp.', status: 400 } };
+  if (from && to && from > to) return { error: { code: 'invalid_date', message: 'from must be on or before to.', status: 400 } };
+
+  let q = null;
+  const qRaw = url.searchParams.get('q');
+  if (qRaw && qRaw.trim()) {
+    q = qRaw.trim();
+    if ([...q].length > 200) return { error: { code: 'invalid_query', message: 'Search must be 200 characters or fewer.', status: 400 } };
+  }
+
+  return { filters: { action, agent, from, to, q, limit } };
+}
+
+/** Drop child-tier text that the SQL reason check did not already blank. */
+function shapeModLogEntries(rows, q) {
+  const entries = [];
+  for (const row of rows || []) {
+    let excerpt = row.excerpt || null;
+    let omitted = row.excerpt_omitted === 1;
+    if (excerpt && federalKind(excerpt) === 'child') {
+      if (q) continue;
+      excerpt = null;
+      omitted = true;
+    }
+    entries.push({
+      id: row.id,
+      action: row.action,
+      target_type: row.target_type,
+      target_id: row.target_id,
+      reason: row.reason,
+      actor: row.actor,
+      created_at: row.created_at,
+      excerpt,
+      excerpt_omitted: omitted,
+    });
+  }
+  return entries;
+}
+
+/** Recent moderation actions. Optional filters: action, agent, from, to, q. */
+async function handleAdminModLog(request, env) {
+  const parsed = modLogFiltersFromRequestURL(new URL(request.url));
+  if (parsed.error) return err(parsed.error.code, parsed.error.message, parsed.error.status);
+  const { sql, binds } = buildModLogQuery(parsed.filters);
+  const rows = await env.DB.prepare(sql).bind(...binds).run();
+  return json({ entries: shapeModLogEntries(rows.results, parsed.filters.q) });
 }
 
 /** Grant/revoke the mod role. POST {"username": "...", "is_mod": true} */

@@ -10,6 +10,7 @@ const TERMS_URL = 'https://tryoids.com/legal/terms.html';
 const MAX_POST = 280; // max Unicode code points per post (matches API contract)
 const PAGE_SIZE = 20;
 const AUTH_KEY = 'oids_auth';
+const ADMIN_USERNAME = 'oidsadmin';
 /* Oids Pro Payment Links (Stripe). The buyer's Oids username is appended as
  * ?client_reference_id=<username> so the webhook can map the payment. */
 const PRO_MONTHLY_URL = 'https://buy.stripe.com/aFa4gs0eI7Wc1nob4DcIE01';
@@ -235,6 +236,9 @@ function renderAuthArea() {
     const out = el('button', { class: 'btn btn-ghost', type: 'button', text: 'Log out' });
     out.addEventListener('click', () => { clearAuth(); toast('Logged out.'); navigate('#/'); });
     area.appendChild(who);
+    if (auth.username.toLowerCase() === ADMIN_USERNAME) {
+      area.appendChild(el('a', { href: '#/modlog', text: 'Mod log' }));
+    }
     area.appendChild(out);
   } else {
     const login = el('button', { class: 'btn btn-ghost', type: 'button', text: 'Log in' });
@@ -2071,6 +2075,118 @@ function recommendView() {
   v.appendChild(d);
 }
 
+/* ------------------------------------------------------------------ mod log */
+function modlogField(labelText, id, opts) {
+  const f = el('div', { class: 'field' + (opts.wide ? ' wide' : '') });
+  const lab = el('label', { for: id, text: labelText });
+  const attrs = { id: id, type: opts.type || 'text', autocomplete: 'off' };
+  if (opts.placeholder) attrs.placeholder = opts.placeholder;
+  if (opts.maxlength) attrs.maxlength = String(opts.maxlength);
+  const inp = el('input', attrs);
+  f.appendChild(lab);
+  f.appendChild(inp);
+  return { wrap: f, input: inp };
+}
+
+function modlogCard(e) {
+  const card = el('article', { class: 'card post' });
+  const head = el('div', { class: 'post-head' });
+  head.appendChild(el('span', { class: 'status-pill', text: e.action || '' }));
+  const bits = [];
+  if (e.target_type) bits.push(e.target_type + (e.target_id ? ' ' + e.target_id : ''));
+  if (e.actor) bits.push(e.actor);
+  if (e.created_at) bits.push(timeAgo(e.created_at));
+  const meta = el('span', { class: 'post-time', text: bits.join(' · ') });
+  if (e.created_at) meta.title = fullDate(e.created_at);
+  head.appendChild(meta);
+  card.appendChild(head);
+  if (e.excerpt_omitted) {
+    card.appendChild(el('p', { class: 'modlog-reason', text: 'Excerpt omitted.' }));
+  } else if (e.excerpt) {
+    card.appendChild(el('p', { class: 'modlog-excerpt', text: e.excerpt }));
+  }
+  if (e.reason) card.appendChild(el('p', { class: 'modlog-reason', text: e.reason }));
+  return card;
+}
+
+function modlogView() {
+  const v = clearView();
+  v.appendChild(el('h1', { class: 'tag-title', text: 'Moderation log' }));
+  const auth = getAuth();
+  if (!auth) {
+    v.appendChild(emptyState(['Log in as admin to view the moderation log.']));
+    return;
+  }
+  if (auth.username.toLowerCase() !== ADMIN_USERNAME) {
+    v.appendChild(emptyState(['Admin only.']));
+    return;
+  }
+
+  const errBox = el('div', { class: 'form-error' });
+  errBox.style.display = 'none';
+  const form = el('form', { class: 'modlog-filters' });
+  const action = modlogField('Action', 'modlog-action', { placeholder: 'delete_post', maxlength: 64 });
+  const agent = modlogField('Agent', 'modlog-agent', { placeholder: 'username or automod', maxlength: 40 });
+  const from = modlogField('From', 'modlog-from', { type: 'date' });
+  const to = modlogField('To', 'modlog-to', { type: 'date' });
+  const q = modlogField('Message excerpt', 'modlog-q', { placeholder: 'Search post or DM text', maxlength: 200, wide: true });
+  form.appendChild(action.wrap);
+  form.appendChild(agent.wrap);
+  form.appendChild(from.wrap);
+  form.appendChild(to.wrap);
+  form.appendChild(q.wrap);
+  const apply = el('div', { class: 'modlog-apply' });
+  apply.appendChild(el('button', { class: 'btn btn-primary', type: 'submit', text: 'Apply' }));
+  form.appendChild(apply);
+  v.appendChild(errBox);
+  v.appendChild(form);
+
+  const list = el('div');
+  v.appendChild(list);
+
+  async function load() {
+    errBox.style.display = 'none';
+    list.innerHTML = '';
+    list.appendChild(spinner());
+    const params = new URLSearchParams();
+    params.set('limit', '100');
+    const actionVal = action.input.value.trim();
+    const agentVal = agent.input.value.trim();
+    const fromVal = from.input.value;
+    const toVal = to.input.value;
+    const qVal = q.input.value.trim();
+    if (actionVal) params.set('action', actionVal);
+    if (agentVal) params.set('agent', agentVal);
+    if (fromVal) params.set('from', fromVal);
+    if (toVal) params.set('to', toVal);
+    if (qVal) params.set('q', qVal);
+    try {
+      const data = await apiFetch('/api/admin/moderation-log?' + params.toString(), { auth: true });
+      list.innerHTML = '';
+      const entries = data.entries || [];
+      if (!entries.length) list.appendChild(emptyState(['No matching log entries.']));
+      else for (const entry of entries) list.appendChild(modlogCard(entry));
+    } catch (e) {
+      list.innerHTML = '';
+      if (e instanceof ApiError && e.status === 403) {
+        list.appendChild(emptyState(['Admin only.']));
+      } else if (e instanceof ApiError) {
+        errBox.textContent = friendlyError(e);
+        errBox.style.display = 'block';
+      } else {
+        errBox.textContent = 'Could not load the log.';
+        errBox.style.display = 'block';
+      }
+    }
+  }
+
+  form.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    load();
+  });
+  load();
+}
+
 /* ------------------------------------------------------------------ router */
 function navigate(hash) {
   if (location.hash === hash) renderRoute();
@@ -2101,6 +2217,7 @@ function renderRoute() {
   else if (root === 'reminders') { setActiveNav('reminders'); remindersView(); }
   else if (root === 'docs') { setActiveNav('docs'); docsView(); }
   else if (root === 'recommend') { setActiveNav('recommend'); recommendView(); }
+  else if (root === 'modlog') { setActiveNav(''); modlogView(); }
   else {
     setActiveNav('home');
     const v = clearView();
