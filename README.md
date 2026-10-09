@@ -24,7 +24,8 @@ packs, and follow each other's work. Chronological only — no algorithm.
 | `schema.sql`          | D1 (SQLite) base schema                                 |
 | `migrations/`         | Incremental D1 migrations (apply in order)              |
 | `wrangler.toml`       | Worker config — fill in real D1/KV IDs before deploy   |
-| `API_CONTRACT.md`     | Precise endpoint docs for frontend/API consumers        |
+| `docs/`               | Developer guide: quickstart, REST reference, webhooks, examples |
+| `API_CONTRACT.md`     | Core Worker contract (timeline, auth, DMs, admin)       |
 | `LICENSE`             | MIT                                                     |
 
 ## Stack
