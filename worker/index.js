@@ -268,7 +268,11 @@ function clientIp(request) {
   return request.headers.get('CF-Connecting-IP') || 'unknown';
 }
 
-/** Simple fixed-window counter in KV. Returns true if under the limit. */
+/**
+ * Simple fixed-window counter in KV. Returns true if under the limit.
+ * Not cached in isolate memory: each key is one actor and one window, and
+ * the count has to be shared by every isolate or the limit is too loose.
+ */
 async function checkLimit(env, kvKey, limit, ttlSeconds) {
   const raw = await env.KV.get(kvKey);
   const n = raw ? parseInt(raw, 10) || 0 : 0;
@@ -283,6 +287,29 @@ function dayStamp() {
 
 function minuteStamp() {
   return new Date().toISOString().slice(0, 16); // YYYY-MM-DDTHH:MM (UTC)
+}
+
+// Global KV flags are read on hot paths and almost never change. Memoize them
+// in isolate memory. Rate-limit counters are not memoized: they are
+// high-cardinality, and a memory cache would under-count across isolates.
+// 2s is long enough that a busy isolate does not re-read KV per request, and
+// short enough that flipping oids:kill still takes the API offline quickly.
+const KV_CONFIG_TTL_MS = 2000;
+const kvConfigMemo = new Map();
+
+async function kvConfigGet(env, key) {
+  const now = Date.now();
+  const hit = kvConfigMemo.get(key);
+  if (hit && hit.expiresAt > now) return hit.value;
+  try {
+    const value = await env.KV.get(key);
+    kvConfigMemo.set(key, { value, expiresAt: now + KV_CONFIG_TTL_MS });
+    return value;
+  } catch (err) {
+    // A kill flag already observed stays in force if KV blips.
+    if (hit && hit.value === '1') return hit.value;
+    throw err;
+  }
 }
 
 /** Read-side limit: per API key when present, else per IP. */
@@ -328,7 +355,7 @@ async function handleSignup(request, env) {
   // oids:invite_only = "0" requires a valid code. Codes are single-use and
   // expire INVITE_TTL_DAYS after minting.
   let inviteCodeId = null;
-  if ((await env.KV.get('oids:invite_only')) !== '0') {
+  if ((await kvConfigGet(env, 'oids:invite_only')) !== '0') {
     const code = String(body.invite_code || '').trim();
     if (!code) {
       return err('invite_required', 'Oids is invite-only right now. A valid invite code is required to sign up.', 403);
@@ -458,11 +485,14 @@ async function handleCreatePost(request, env) {
   );
 }
 
-const POST_SELECT = `
-  SELECT p.id AS id, a.username AS username, p.content AS content,
+const POST_COLUMNS = `
+         p.id AS id, a.username AS username, p.content AS content,
          p.created_at AS created_at,
          (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
-         (SELECT GROUP_CONCAT(t.tag, ',') FROM post_tags t WHERE t.post_id = p.id) AS tags
+         (SELECT GROUP_CONCAT(t.tag, ',') FROM post_tags t WHERE t.post_id = p.id) AS tags`;
+
+const POST_SELECT = `
+  SELECT ${POST_COLUMNS}
   FROM posts p JOIN agents a ON a.id = p.agent_id WHERE p.deleted_at IS NULL`;
 // NOTE: every consumer appends AND-clauses. Soft-deleted posts never surface;
 // their rows are preserved in D1 for evidence/retention.
@@ -487,11 +517,21 @@ async function handleTimeline(request, env) {
   const beforeRaw = url.searchParams.get('before');
   const before = beforeRaw ? parseInt(beforeRaw, 10) : null;
 
-  const res = await env.DB.prepare(
-    POST_SELECT + ` AND (?1 IS NULL OR p.id < ?1) ORDER BY p.id DESC LIMIT ?2`
-  )
-    .bind(Number.isFinite(before) ? before : null, limit)
-    .run();
+  // Two statements so the cursor is a real range. `AND (? IS NULL OR p.id < ?)`
+  // stops SQLite using the rowid bound: at 200k posts that walked every live
+  // row via idx_posts_deleted (~2ms locally) instead of seeking (~0.01ms).
+  let res;
+  if (Number.isFinite(before)) {
+    res = await env.DB.prepare(
+      POST_SELECT + ` AND p.id < ?1 ORDER BY p.id DESC LIMIT ?2`
+    )
+      .bind(before, limit)
+      .run();
+  } else {
+    res = await env.DB.prepare(POST_SELECT + ` ORDER BY p.id DESC LIMIT ?1`)
+      .bind(limit)
+      .run();
+  }
   return json({ posts: res.results.map(rowToPost) });
 }
 
@@ -505,15 +545,14 @@ async function handleProfile(request, env, username) {
   let limit = parseInt(url.searchParams.get('limit') || String(TIMELINE_DEFAULT), 10);
   if (!Number.isFinite(limit) || limit < 1) limit = TIMELINE_DEFAULT;
   limit = Math.min(limit, TIMELINE_MAX);
-  const posts = await env.DB.prepare(POST_SELECT + ` AND p.agent_id = ?1 ORDER BY p.id DESC LIMIT ?2`)
-    .bind(agent.id, limit)
-    .run();
-  const counts = await env.DB.prepare(
-    `SELECT (SELECT COUNT(*) FROM posts WHERE agent_id = ?1 AND deleted_at IS NULL) AS post_count,
-            (SELECT COUNT(*) FROM likes l JOIN posts p ON p.id = l.post_id WHERE p.agent_id = ?1 AND p.deleted_at IS NULL) AS likes_received`
-  )
-    .bind(agent.id)
-    .run();
+  // One D1 round trip for the post page and the profile counts.
+  const [posts, counts] = await env.DB.batch([
+    env.DB.prepare(POST_SELECT + ` AND p.agent_id = ?1 ORDER BY p.id DESC LIMIT ?2`).bind(agent.id, limit),
+    env.DB.prepare(
+      `SELECT (SELECT COUNT(*) FROM posts WHERE agent_id = ?1 AND deleted_at IS NULL) AS post_count,
+              (SELECT COUNT(*) FROM likes l JOIN posts p ON p.id = l.post_id WHERE p.agent_id = ?1 AND p.deleted_at IS NULL) AS likes_received`
+    ).bind(agent.id),
+  ]);
   const c = counts.results[0];
   return json({
     username: agent.username,
@@ -564,10 +603,17 @@ async function handleRss(request, env, kind, value) {
     const tag = value.toLowerCase();
     title = `Oids — posts tagged #${tag}`;
     link = `/api/rss/tag/${tag}`;
+    // Start from the tag index (idx_post_tags_tag_post) and walk newest post
+    // ids. The old EXISTS plan scanned posts and probed tags per row.
     rows = (
       await env.DB.prepare(
-        POST_SELECT +
-          ` AND EXISTS (SELECT 1 FROM post_tags pt WHERE pt.post_id = p.id AND pt.tag = ?1) ORDER BY p.id DESC LIMIT 20`
+        `SELECT ${POST_COLUMNS}
+         FROM post_tags pt
+         JOIN posts p ON p.id = pt.post_id AND p.deleted_at IS NULL
+         JOIN agents a ON a.id = p.agent_id
+         WHERE pt.tag = ?1
+         ORDER BY pt.post_id DESC
+         LIMIT 20`
       )
         .bind(tag)
         .run()
@@ -747,16 +793,49 @@ async function handleDmUnread(request, env) {
 // Comms layer v1: developer quickstart page, public agent directory, leaderboard
 // ---------------------------------------------------------------------------
 
-/** Shared leaderboard query: top agents by likes received on their posts in the last 7 days. */
-async function topAgents7d(env, limit) {
+// The 7-day board changes slowly. Cache one D1 read per isolate and serve
+// both /api/agents/leaderboard (top 20) and /developers (top 5) from it.
+const LEADERBOARD_TTL_MS = 30000;
+const LEADERBOARD_CACHE_LIMIT = 20;
+let leaderboardCache = { at: 0, rows: null };
+let leaderboardInflight = null;
+
+/**
+ * Top agents by likes received on their posts in the last 7 days.
+ * Aggregates the window once. The old query ran two correlated counts per
+ * agent and then sorted, so LIMIT could not stop early (~10ms locally at
+ * 2,000 agents, and indexes alone did not change that plan).
+ * INDEXED BY is required: without it the planner groups through
+ * idx_posts_agent and ignores the 7-day range. Needs migration 006.
+ */
+async function queryTopAgents7d(env, limit) {
   const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
   const rows = await env.DB.prepare(
-    `SELECT a.username AS username,
-       (SELECT COUNT(*) FROM likes l JOIN posts p ON p.id = l.post_id
-         WHERE p.agent_id = a.id AND p.deleted_at IS NULL AND l.created_at >= ?1) AS likes_received_7d,
-       (SELECT COUNT(*) FROM posts p WHERE p.agent_id = a.id AND p.deleted_at IS NULL
-         AND p.created_at >= ?1) AS post_count_7d
-     FROM agents a
+    `WITH post_counts AS (
+       SELECT agent_id, COUNT(*) AS post_count_7d
+       FROM posts INDEXED BY idx_posts_live_created
+       WHERE deleted_at IS NULL AND created_at >= ?1
+       GROUP BY agent_id
+     ),
+     like_counts AS (
+       SELECT p.agent_id AS agent_id, COUNT(*) AS likes_received_7d
+       FROM likes l INDEXED BY idx_likes_created
+       JOIN posts p ON p.id = l.post_id AND p.deleted_at IS NULL
+       WHERE l.created_at >= ?1
+       GROUP BY p.agent_id
+     ),
+     active AS (
+       SELECT agent_id FROM post_counts
+       UNION
+       SELECT agent_id FROM like_counts
+     )
+     SELECT a.username AS username,
+            COALESCE(lc.likes_received_7d, 0) AS likes_received_7d,
+            COALESCE(pc.post_count_7d, 0) AS post_count_7d
+     FROM active
+     JOIN agents a ON a.id = active.agent_id
+     LEFT JOIN post_counts pc ON pc.agent_id = active.agent_id
+     LEFT JOIN like_counts lc ON lc.agent_id = active.agent_id
      ORDER BY likes_received_7d DESC, post_count_7d DESC, a.created_at DESC
      LIMIT ?2`
   )
@@ -765,17 +844,44 @@ async function topAgents7d(env, limit) {
   return rows.results.filter((r) => r.likes_received_7d > 0 || r.post_count_7d > 0);
 }
 
+async function topAgents7d(env, limit) {
+  if (limit > LEADERBOARD_CACHE_LIMIT) return queryTopAgents7d(env, limit);
+  const now = Date.now();
+  if (leaderboardCache.rows && now - leaderboardCache.at < LEADERBOARD_TTL_MS) {
+    return leaderboardCache.rows.slice(0, limit);
+  }
+  if (!leaderboardInflight) {
+    leaderboardInflight = queryTopAgents7d(env, LEADERBOARD_CACHE_LIMIT)
+      .then((rows) => {
+        leaderboardCache = { at: Date.now(), rows };
+        return rows;
+      })
+      .finally(() => {
+        leaderboardInflight = null;
+      });
+  }
+  const rows = await leaderboardInflight;
+  return rows.slice(0, limit);
+}
+
 /** GET /api/agents/directory — public agent directory, newest agents first (no auth). */
 async function handleAgentDirectory(request, env) {
   if (!(await checkReadLimit(request, env))) return err('rate_limited', 'Read limit reached. Slow down.', 429);
+  // Bound the counts to the 100 newest agents (idx_agents_created). The old
+  // query sorted every agent and ran two counts per row (~8ms → ~0.4ms locally).
   const rows = await env.DB.prepare(
-    `SELECT a.username AS username, a.bio AS bio, a.created_at AS created_at,
-       (SELECT COUNT(*) FROM posts p WHERE p.agent_id = a.id AND p.deleted_at IS NULL) AS post_count,
+    `WITH newest AS (
+       SELECT id, username, bio, created_at
+       FROM agents
+       ORDER BY created_at DESC
+       LIMIT 100
+     )
+     SELECT n.username AS username, n.bio AS bio, n.created_at AS created_at,
+       (SELECT COUNT(*) FROM posts p WHERE p.agent_id = n.id AND p.deleted_at IS NULL) AS post_count,
        (SELECT COUNT(*) FROM likes l JOIN posts p ON p.id = l.post_id
-         WHERE p.agent_id = a.id AND p.deleted_at IS NULL) AS likes_received
-     FROM agents a
-     ORDER BY a.created_at DESC
-     LIMIT 100`
+         WHERE p.agent_id = n.id AND p.deleted_at IS NULL) AS likes_received
+     FROM newest n
+     ORDER BY n.created_at DESC`
   ).run();
   return json({
     agents: rows.results.map((r) => ({
@@ -963,15 +1069,18 @@ async function handleAdminMintCodes(request, env, admin) {
   const now = new Date().toISOString();
   const expiresAt = inviteExpiry();
   const codes = [];
+  const inserts = [];
   for (let i = 0; i < count; i++) {
     const code = INVITE_CODE_PREFIX + b64url(randomBytes(9));
-    await env.DB.prepare(
-      'INSERT INTO invite_codes (code, created_by, created_at, note, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)'
-    )
-      .bind(code, admin.agent_id, now, note, expiresAt)
-      .run();
+    inserts.push(
+      env.DB.prepare(
+        'INSERT INTO invite_codes (code, created_by, created_at, note, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)'
+      ).bind(code, admin.agent_id, now, note, expiresAt)
+    );
     codes.push(code);
   }
+  // One D1 round trip instead of one INSERT per code (count is at most 50).
+  await env.DB.batch(inserts);
   await logMod(env, 'mint_invite_codes', 'invite_batch', null, `${count} codes. ${note || ''}`.trim(), 'admin:' + admin.username);
   return json({ codes, count: codes.length, expires_at: expiresAt }, 201);
 }
@@ -1083,10 +1192,11 @@ async function handleAdminSetMod(request, env, admin) {
 // ---------------------------------------------------------------------------
 export default {
   async fetch(request, env) {
-    // KILL SWITCH: flip KV oids:kill to "1" to take the whole API offline instantly.
-    // One KV read per request; fails open if KV itself is unreachable.
+    // KILL SWITCH: flip KV oids:kill to "1" to take the whole API offline.
+    // Memoized for KV_CONFIG_TTL_MS (see kvConfigGet). Fails open if KV is
+    // unreachable and this isolate has not already observed "1".
     try {
-      if ((await env.KV.get('oids:kill')) === '1') {
+      if ((await kvConfigGet(env, 'oids:kill')) === '1') {
         return withCors(request, new Response('Oids is temporarily unavailable. Try again later.', {
           status: 503,
           headers: { 'Content-Type': 'text/plain; charset=utf-8', ...securityHeaders() },
