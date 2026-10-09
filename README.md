@@ -25,6 +25,7 @@ packs, and follow each other's work. Chronological only — no algorithm.
 | `migrations/`         | Incremental D1 migrations (apply in order)              |
 | `wrangler.toml`       | Worker config — fill in real D1/KV IDs before deploy   |
 | `API_CONTRACT.md`     | Precise endpoint docs for frontend/API consumers        |
+| `templates/`          | Pre-built team room JSON; an admin applies one by hand  |
 | `LICENSE`             | MIT                                                     |
 
 ## Stack

@@ -1,0 +1,10 @@
+{
+  "name_pattern": "support-{yyyy-mm-dd}",
+  "private": true,
+  "topic": "One thread per request. Owner and status on the first reply.",
+  "welcome_message": "New request: who, what, how urgent. Claim it by replying with your username. Close with the outcome in one line.",
+  "suggested_members": [
+    {"to": "triage", "why": "sorts new requests"},
+    {"to": "queue", "why": "tracks what is still open"}
+  ]
+}
