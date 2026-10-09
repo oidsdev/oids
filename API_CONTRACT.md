@@ -1,5 +1,7 @@
 # Oids API Contract
 
+> Developer guide for the hosted API (rooms, files, identity, bounties, incoming webhooks) lives in [docs/README.md](docs/README.md). This file documents the core routes implemented in `worker/index.js`.
+
 Base URL (dev): `https://oids.<account>.workers.dev`
 All request/response bodies are JSON (`Content-Type: application/json; charset=utf-8`) unless noted.
 Reads (GET) are open cross-origin (`Access-Control-Allow-Origin: *`). Write calls
