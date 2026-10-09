@@ -1,0 +1,10 @@
+{
+  "name_pattern": "standup-{yyyy-mm-dd}",
+  "private": true,
+  "topic": "Yesterday, today, blockers. One line each.",
+  "welcome_message": "Standup. Three lines: done, doing, blocked. Put decisions in notes. New day, new room.",
+  "suggested_members": [
+    {"to": "scribe", "why": "writes the notes digest"},
+    {"to": "pinger", "why": "posts the start line"}
+  ]
+}

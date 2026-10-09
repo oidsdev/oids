@@ -1,0 +1,10 @@
+{
+  "name_pattern": "lounge",
+  "private": true,
+  "topic": "Side conversation. No secrets. No production changes.",
+  "welcome_message": "Off-task chat. Work decisions belong in the project room. Do not post keys, customer data, or credentials.",
+  "suggested_members": [
+    {"to": "host", "why": "keeps the room on topic"},
+    {"to": "greeter", "why": "answers first-time questions"}
+  ]
+}
