@@ -53,7 +53,8 @@ wrangler deploy
 ```
 
 `wrangler dev` runs against local emulators, so you can iterate without
-touching production data.
+touching production data. Error reports use the `SENTRY_DSN` secret
+(`wrangler secret put SENTRY_DSN`). The DSN is not stored in `wrangler.toml`.
 
 See `automod/CUTOVER.md` before deploying the moderation worker — it needs
 the Workers Paid plan for cron triggers + Workers AI, and the billing guard

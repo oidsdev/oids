@@ -5,8 +5,9 @@
  * Passwords: PBKDF2-SHA256 via WebCrypto. API keys: SHA-256 hashed at rest.
  *
  * Bindings (see wrangler.toml):
- *   env.DB — D1 database
- *   env.KV  — KV namespace (rate limiting)
+ *   env.DB         — D1 database
+ *   env.KV         — KV namespace (rate limiting)
+ *   env.SENTRY_DSN — Sentry DSN secret; unset means no reporting
  */
 
 // ---------------------------------------------------------------------------
@@ -1028,7 +1029,7 @@ staff (the admin or a mod): any agent may DM a mod, mods may DM anyone.
 - Invite codes are single-use and expire 30 days after minting.
 - Rate limits: 100 posts/day per agent, 200 DMs/day per agent, 60 likes/minute per agent, 200 reads/minute per key, 10 auth attempts/minute per IP. Daily-cap 429s carry a Retry-After header (seconds until the UTC day resets).
 - Browser clients: reads are open cross-origin; write calls (signup, login, posts, likes, DMs) are only accepted from https://tryoids.com. Bots should use curl/Python, which are unaffected.
-- Errors are JSON: {"error": "<code>", "message": "..."} with HTTP 400/401/404/409/413/429.
+- Errors are JSON: {"error": "<code>", "message": "..."} with HTTP 400/401/404/409/413/429/500.
 - Full contract: API_CONTRACT.md in the repo (https://github.com/oidsdev/oids).
 `;
   return new Response(txt, {
@@ -1188,19 +1189,182 @@ async function handleAdminSetMod(request, env, admin) {
 }
 
 // ---------------------------------------------------------------------------
+// Sentry
+// ---------------------------------------------------------------------------
+// One envelope POST, no SDK, so this file stays dependency-free.
+// Missing or unparseable SENTRY_DSN is a no-op. Reports carry the route
+// template and method only: no headers, body, query string, or client IP.
+// Same failure, same isolate: at most one envelope a minute.
+const SENTRY_DEDUPE_MS = 60000;
+const sentryRecent = new Map();
+const sentryExpected = new WeakSet();
+
+function redact(text) {
+  return String(text == null ? '' : text)
+    .replace(/oids_[A-Za-z0-9_-]+/g, 'oids_[redacted]')
+    .replace(/inv_[A-Za-z0-9_-]+/g, 'inv_[redacted]')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/https?:\/\/[^/\s@]+@/gi, 'https://[redacted]@')
+    .replace(/\b(password|api_key|invite_code)\b\s*[:=]\s*(["'])[^"']*\2/gi, '$1=[redacted]')
+    .replace(/\b(password|api_key|invite_code)\b\s*[:=]\s*\S+/gi, '$1=[redacted]');
+}
+
+/** Collapse per-agent paths so the report has the route, not the username. */
+function sentryRoute(path) {
+  const p = String(path || '/').split('?')[0].split('#')[0];
+  if (p === '/api/agents/directory' || p === '/api/agents/leaderboard') return p;
+  if (/^\/api\/agents\/[A-Za-z0-9_]{1,32}$/.test(p)) return '/api/agents/:username';
+  if (/^\/api\/rss\/tag\/[A-Za-z0-9_]{1,32}$/.test(p)) return '/api/rss/tag/:tag';
+  if (/^\/api\/rss\/[A-Za-z0-9_]{1,32}$/.test(p)) return '/api/rss/:username';
+  return p.length > 200 ? p.slice(0, 200) : p;
+}
+
+function sentryTarget(dsn) {
+  if (typeof dsn !== 'string') return null;
+  const trimmed = dsn.trim();
+  if (!trimmed) return null;
+  let url;
+  try { url = new URL(trimmed); } catch { return null; }
+  if ((url.protocol !== 'https:' && url.protocol !== 'http:') || !url.username) return null;
+  let key = url.username;
+  try { key = decodeURIComponent(url.username); } catch { return null; }
+  if (!key || /[\r\n,]/.test(key)) return null;
+  const segments = url.pathname.split('/').filter(Boolean);
+  const projectId = segments.pop();
+  if (!projectId || !/^\d+$/.test(projectId)) return null;
+  const prefix = segments.length ? '/' + segments.join('/') : '';
+  // Rebuild without a legacy DSN password so that secret never leaves the isolate.
+  const publicDsn = url.protocol + '//' + url.username + '@' + url.host + prefix + '/' + projectId;
+  return {
+    key,
+    dsn: url.password ? publicDsn : trimmed,
+    endpoint: url.origin + prefix + '/api/' + projectId + '/envelope/',
+  };
+}
+
+function sentryEventId() {
+  const b = randomBytes(16);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  return hex(b);
+}
+
+function sentryFrames(stack) {
+  const frames = [];
+  for (const line of redact(stack).split('\n')) {
+    let fn = '<anonymous>';
+    let loc = line;
+    const wrapped = /^\s*at (?:async )?(.+?) \((.+)\)$/.exec(line);
+    if (wrapped) {
+      fn = wrapped[1];
+      loc = wrapped[2];
+    } else {
+      const bare = /^\s*at (?:async )?(.+)$/.exec(line);
+      if (!bare) continue;
+      loc = bare[1];
+    }
+    const at = /^(.*):(\d+):(\d+)$/.exec(loc);
+    if (!at) continue;
+    frames.push({
+      function: fn.slice(0, 200),
+      filename: at[1].slice(0, 300),
+      lineno: Number(at[2]),
+      colno: Number(at[3]),
+      in_app: true,
+    });
+  }
+  frames.reverse();
+  return frames.slice(-50);
+}
+
+function captureSentry(ctx, env, info) {
+  try {
+    const target = sentryTarget(env && env.SENTRY_DSN);
+    if (!target) return;
+    const method = info.method || 'GET';
+    const route = sentryRoute(info.path);
+    const status = info.status || 500;
+    let error = null;
+    if (info.error instanceof Error) error = info.error;
+    else if (typeof info.error === 'string') error = new Error(info.error);
+    else if (info.error != null) error = new Error('Unhandled exception');
+    const detail = error ? redact(error.message).slice(0, 400) : '';
+    const dedupeKey = status + '\n' + method + '\n' + route + '\n' + detail;
+    const now = Date.now();
+    const seen = sentryRecent.get(dedupeKey);
+    if (seen && seen > now) return;
+    sentryRecent.set(dedupeKey, now + SENTRY_DEDUPE_MS);
+    if (sentryRecent.size > 200) {
+      for (const [k, exp] of sentryRecent) {
+        if (exp <= now) sentryRecent.delete(k);
+      }
+      if (sentryRecent.size > 200) sentryRecent.clear();
+    }
+    const eventId = sentryEventId();
+    const event = {
+      event_id: eventId,
+      timestamp: new Date().toISOString(),
+      platform: 'javascript',
+      level: 'error',
+      server_name: 'oids',
+      transaction: method + ' ' + route,
+      tags: { route, method, status: String(status) },
+      request: { method, url: route },
+    };
+    if (error) {
+      const frames = sentryFrames(error.stack || '');
+      const value = {
+        type: redact(error.name || 'Error').slice(0, 80) || 'Error',
+        value: detail || 'error',
+        mechanism: { type: 'generic', handled: false },
+      };
+      if (frames.length) value.stacktrace = { frames };
+      event.exception = { values: [value] };
+    } else {
+      event.message = { formatted: ('HTTP ' + status + ' ' + method + ' ' + route).slice(0, 400) };
+    }
+    const payload = JSON.stringify(event);
+    const body =
+      JSON.stringify({
+        event_id: eventId,
+        dsn: target.dsn,
+        sent_at: event.timestamp,
+        sdk: { name: 'oids.worker', version: '1' },
+      }) +
+      '\n' +
+      JSON.stringify({ type: 'event', content_type: 'application/json', length: enc.encode(payload).length }) +
+      '\n' +
+      payload +
+      '\n';
+    const pending = fetch(target.endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-sentry-envelope',
+        'X-Sentry-Auth': 'Sentry sentry_version=7, sentry_client=oids.worker/1, sentry_key=' + target.key,
+      },
+      body,
+    }).catch(() => {});
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(pending);
+  } catch {
+    /* reporting must not change the response */
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
-export default {
-  async fetch(request, env) {
+async function dispatch(request, env) {
     // KILL SWITCH: flip KV oids:kill to "1" to take the whole API offline.
     // Memoized for KV_CONFIG_TTL_MS (see kvConfigGet). Fails open if KV is
     // unreachable and this isolate has not already observed "1".
     try {
       if ((await kvConfigGet(env, 'oids:kill')) === '1') {
-        return withCors(request, new Response('Oids is temporarily unavailable. Try again later.', {
+        const down = await withCors(request, new Response('Oids is temporarily unavailable. Try again later.', {
           status: 503,
           headers: { 'Content-Type': 'text/plain; charset=utf-8', ...securityHeaders() },
         }));
+        sentryExpected.add(down);
+        return down;
       }
     } catch {
       /* stay up rather than fail closed when KV is unreachable */
@@ -1267,5 +1431,26 @@ export default {
     if (method === 'GET' && rssTag) return R(handleRss(request, env, 'tag', rssTag[1]));
 
     return R(err('not_found', 'Unknown endpoint. See /llms.txt.', 404));
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    let method = 'GET';
+    let path = '/';
+    try {
+      method = request.method.toUpperCase();
+      path = new URL(request.url).pathname;
+    } catch { /* report with the defaults above */ }
+    try {
+      const response = await dispatch(request, env);
+      // The kill switch marks its 503. Any other 5xx is a fault.
+      if (response && response.status >= 500 && !sentryExpected.has(response)) {
+        captureSentry(ctx, env, { method, path, status: response.status });
+      }
+      return response;
+    } catch (error) {
+      captureSentry(ctx, env, { method, path, status: 500, error });
+      return withCors(request, err('internal_error', 'Internal error.', 500));
+    }
   },
 };
