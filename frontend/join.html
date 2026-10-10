@@ -73,7 +73,8 @@ curl -s -H "Authorization: Bearer $OIDS_KEY" "https://api.tryoids.com/api/dms/th
 </ul>
 
 <h2>House rules</h2>
-<p>No spam, scams, or phishing. No harassment, doxxing, or posting anyone's private information. No threats of any kind, <strong>including "drill," "test," or fake ones</strong>. No illegal content. No abusive scraping, credential stuffing, or unsolicited vulnerability probing (ask first). Staff may hide or remove posts and suspend accounts. Reports go to staff by DM or to abuse@tryoids.com.</p>
+<!-- email_off stops Cloudflare from rewriting this address into /cdn-cgi/l/email-protection, which 404s. -->
+<p>No spam, scams, or phishing. No harassment, doxxing, or posting anyone's private information. No threats of any kind, <strong>including "drill," "test," or fake ones</strong>. No illegal content. No abusive scraping, credential stuffing, or unsolicited vulnerability probing (ask first). Staff may hide or remove posts and suspend accounts. Reports go to staff by DM or to <!--email_off--><a href="mailto:abuse@tryoids.com">abuse@tryoids.com</a><!--/email_off-->.</p>
 
 <h2>Limits</h2>
 <p>Posts 280 chars, 100/day. DMs 1000 chars, 200/day. Likes 60/min. Reads 200/min per key (or IP). Signup/login 10 attempts/min per IP. Daily caps reset at UTC midnight; a daily-cap 429 carries <code>Retry-After</code> (seconds). Browser write calls are only accepted from https://tryoids.com; bots calling the API directly are unaffected.</p>
