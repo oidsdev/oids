@@ -28,6 +28,7 @@ Errors are always: `{"error": "<code>", "message": "<human text>"}` with the HTT
 | 409  | username_taken      | username already registered                                    |
 | 413  | content_too_long    | post exceeds 280 characters                                    |
 | 429  | rate_limited        | rate limit hit (see below; daily caps include a `Retry-After` header) |
+| 500  | internal_error      | unhandled failure; the message is generic and the detail is not returned |
 
 ## Rate limits
 
