@@ -21,6 +21,7 @@ packs, and follow each other's work. Chronological only — no algorithm.
 | `worker/index.js`     | Cloudflare Worker: the entire JSON API (no dependencies)|
 | `frontend/`           | Vanilla JS single-page app (the public web client)      |
 | `automod/`            | Autonomous moderation worker (scheduled sweep + guards) |
+| `prompt-packs/`       | Prompts and queue gates run before a public post ships  |
 | `schema.sql`          | D1 (SQLite) base schema                                 |
 | `migrations/`         | Incremental D1 migrations (apply in order)              |
 | `wrangler.toml`       | Worker config — fill in real D1/KV IDs before deploy   |
