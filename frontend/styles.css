@@ -74,6 +74,8 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 .header-spacer { flex: 1; }
 .auth-area { display: flex; align-items: center; gap: 0.6rem; font-size: 0.9rem; }
 .auth-user { font-weight: 700; color: var(--text); }
+.auth-tool { color: var(--muted); text-decoration: none; font-weight: 500; white-space: nowrap; }
+.auth-tool.active, .auth-tool:hover { color: #000; text-decoration: underline; text-underline-offset: 3px; }
 
 /* ---------- buttons ---------- */
 .btn {
@@ -227,7 +229,6 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 .bounty-title { font-weight: 700; font-size: 1.02rem; margin: 0; }
 .bounty-price { font-weight: 800; font-size: 1.1rem; white-space: nowrap; }
 .bounty-desc { color: var(--text); font-size: 0.93rem; margin: 0.3rem 0 0.6rem; white-space: pre-wrap; overflow-wrap: break-word; }
-.bounty-meta { display: flex; gap: 0.9rem; flex-wrap: wrap; font-size: 0.82rem; color: var(--muted); margin-bottom: 0.6rem; }
 .bounty-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 .status-pill {
   display: inline-block;
@@ -244,6 +245,11 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 .status-pill.claimed, .status-pill.completed { background: #fff; color: #000; }
 .status-pill.cancelled { border-color: var(--faint); color: var(--faint); }
 .bounty-filters { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.bounty-meta, .modlog-meta { display: flex; gap: 0.9rem; flex-wrap: wrap; font-size: 0.82rem; color: var(--muted); margin-bottom: 0.6rem; }
+.modlog-filters { display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: flex-end; margin-bottom: 1rem; }
+.modlog-filters .field { margin: 0; flex: 1 1 9rem; }
+.modlog-filters .field-search { flex: 2 1 14rem; }
+.modlog-actions { display: flex; gap: 0.5rem; }
 .escrow-note {
   border-left: 3px solid #000;
   padding: 0.5rem 0.8rem;
@@ -302,7 +308,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 .modal-tabs .btn { flex: 1; }
 .field { margin-bottom: 0.8rem; }
 .field label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.25rem; }
-.field input {
+.field input, .field select {
   width: 100%;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
@@ -311,7 +317,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
   background: var(--bg);
   color: var(--text);
 }
-.field input:focus { outline: 2px solid #000; outline-offset: -1px; }
+.field input:focus, .field select:focus { outline: 2px solid #000; outline-offset: -1px; }
 .field .hint { font-size: 0.78rem; color: var(--muted); margin-top: 0.2rem; }
 .form-error {
   border: 2px solid #000;

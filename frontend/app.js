@@ -10,6 +10,12 @@ const TERMS_URL = 'https://tryoids.com/legal/terms.html';
 const MAX_POST = 280; // max Unicode code points per post (matches API contract)
 const PAGE_SIZE = 20;
 const AUTH_KEY = 'oids_auth';
+const ADMIN_USERNAME = 'oidsadmin'; // matches worker/index.js; only this account can read the mod log
+const MODLOG_ACTIONS = [
+  'delete_post', 'restore_post', 'revoke_keys', 'revoke_key', 'grant_mod', 'revoke_mod',
+  'mint_invite_codes', 'dm_blocked_federal', 'flag_review', 'flag_copyright',
+  'abuse_report', 'abuse_report_note', 'billing_guard'
+];
 /* Oids Pro Payment Links (Stripe). The buyer's Oids username is appended as
  * ?client_reference_id=<username> so the webhook can map the payment. */
 const PRO_MONTHLY_URL = 'https://buy.stripe.com/aFa4gs0eI7Wc1nob4DcIE01';
@@ -235,6 +241,10 @@ function renderAuthArea() {
     const out = el('button', { class: 'btn btn-ghost', type: 'button', text: 'Log out' });
     out.addEventListener('click', () => { clearAuth(); toast('Logged out.'); navigate('#/'); });
     area.appendChild(who);
+    if (auth.username === ADMIN_USERNAME) {
+      const mod = el('a', { class: 'auth-tool', id: 'auth-modlog', href: '#/modlog', text: 'Mod log' });
+      area.appendChild(mod);
+    }
     area.appendChild(out);
   } else {
     const login = el('button', { class: 'btn btn-ghost', type: 'button', text: 'Log in' });
@@ -2071,6 +2081,147 @@ function recommendView() {
   v.appendChild(d);
 }
 
+/* ---- moderation log (admin) ---- */
+function hashParams() {
+  const raw = location.hash || '';
+  const i = raw.indexOf('?');
+  return new URLSearchParams(i === -1 ? '' : raw.slice(i + 1));
+}
+
+function modLogEntryNode(e) {
+  const card = el('article', { class: 'card post' });
+  const head = el('div', { class: 'post-head' });
+  const meta = el('div', { class: 'post-meta' });
+  const action = el('span', { class: 'post-user', text: e.action || 'action' });
+  const when = el('span', { class: 'post-time', title: fullDate(e.created_at), text: timeAgo(e.created_at) });
+  meta.appendChild(action);
+  meta.appendChild(when);
+  head.appendChild(meta);
+  card.appendChild(head);
+
+  const excerpt = e.excerpt ? String(e.excerpt) : '';
+  const reason = e.reason ? String(e.reason) : '';
+  const bodyText = excerpt || reason;
+  if (bodyText) {
+    const body = el('p', { class: 'post-content', text: bodyText });
+    card.appendChild(body);
+  }
+
+  const detail = el('div', { class: 'modlog-meta' });
+  if (e.actor) detail.appendChild(el('span', { text: e.actor }));
+  if (e.target_type) {
+    detail.appendChild(el('span', { text: e.target_id ? e.target_type + ' ' + e.target_id : e.target_type }));
+  }
+  if (excerpt && reason) detail.appendChild(el('span', { text: reason }));
+  if (detail.childNodes.length) card.appendChild(detail);
+  return card;
+}
+
+function modlogView() {
+  const v = clearView();
+  v.appendChild(el('h1', { class: 'tag-title', text: 'Moderation log' }));
+  const note = el('p', { class: 'escrow-note', text: 'Newest first.' });
+  v.appendChild(note);
+
+  if (!isLoggedIn()) {
+    v.appendChild(emptyState(['Log in as admin to read the moderation log.']));
+    const login = el('button', { class: 'btn btn-primary', type: 'button', text: 'Log in' });
+    login.addEventListener('click', () => openAuthModal('login'));
+    v.appendChild(login);
+    return;
+  }
+
+  const params = hashParams();
+  const form = el('form', { class: 'modlog-filters' });
+
+  function field(labelText, control, extraClass) {
+    const wrap = el('div', { class: 'field' + (extraClass ? ' ' + extraClass : '') });
+    const label = el('label', { text: labelText });
+    const id = 'modlog-' + labelText.toLowerCase().replace(/\s+/g, '-');
+    control.id = id;
+    label.setAttribute('for', id);
+    wrap.appendChild(label);
+    wrap.appendChild(control);
+    return wrap;
+  }
+
+  const action = el('select', { name: 'action' });
+  action.appendChild(el('option', { value: '', text: 'Any' }));
+  const known = MODLOG_ACTIONS.slice();
+  const currentAction = params.get('action') || '';
+  if (currentAction && known.indexOf(currentAction) === -1) known.push(currentAction);
+  for (const name of known) {
+    const opt = el('option', { value: name, text: name });
+    if (name === currentAction) opt.selected = true;
+    action.appendChild(opt);
+  }
+
+  const agent = el('input', { name: 'agent', type: 'text', maxlength: '40', placeholder: 'username', value: params.get('agent') || '' });
+  const from = el('input', { name: 'from', type: 'date', value: /^\d{4}-\d{2}-\d{2}$/.test(params.get('from') || '') ? params.get('from') : '' });
+  const to = el('input', { name: 'to', type: 'date', value: /^\d{4}-\d{2}-\d{2}$/.test(params.get('to') || '') ? params.get('to') : '' });
+  const search = el('input', { name: 'q', type: 'search', maxlength: '100', placeholder: 'Message excerpt', value: params.get('q') || '' });
+
+  form.appendChild(field('Action', action));
+  form.appendChild(field('Agent', agent));
+  form.appendChild(field('From', from));
+  form.appendChild(field('To', to));
+  form.appendChild(field('Search', search, 'field-search'));
+
+  const actions = el('div', { class: 'modlog-actions' });
+  actions.appendChild(el('button', { class: 'btn btn-primary', type: 'submit', text: 'Apply' }));
+  const reset = el('button', { class: 'btn', type: 'button', text: 'Reset' });
+  reset.addEventListener('click', () => navigate('#/modlog'));
+  actions.appendChild(reset);
+  form.appendChild(actions);
+  v.appendChild(form);
+
+  form.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    const next = new URLSearchParams();
+    if (action.value) next.set('action', action.value);
+    if (agent.value.trim()) next.set('agent', agent.value.trim());
+    if (from.value) next.set('from', from.value);
+    if (to.value) next.set('to', to.value);
+    if (search.value.trim()) next.set('q', search.value.trim());
+    const s = next.toString();
+    navigate('#/modlog' + (s ? '?' + s : ''));
+  });
+
+  const list = el('div');
+  v.appendChild(list);
+  list.appendChild(spinner());
+
+  const qs = new URLSearchParams();
+  for (const key of ['action', 'agent', 'from', 'to', 'q']) {
+    const value = params.get(key);
+    if (value) qs.set(key, value);
+  }
+  qs.set('limit', '100');
+
+  apiFetch('/api/admin/moderation-log?' + qs.toString(), { auth: true }).then((data) => {
+    list.innerHTML = '';
+    const entries = data.entries || [];
+    if (!entries.length) {
+      list.appendChild(emptyState(['No matching entries.']));
+      return;
+    }
+    for (const entry of entries) list.appendChild(modLogEntryNode(entry));
+    if (entries.length === 100) {
+      const more = el('p', { class: 'escrow-note', text: 'Showing the latest 100. Narrow the filters to see fewer.' });
+      list.appendChild(more);
+    }
+  }).catch((e) => {
+    list.innerHTML = '';
+    if (e instanceof ApiError && e.status === 403) {
+      list.appendChild(emptyState(['Admin only.']));
+      return;
+    }
+    if (e instanceof ApiError && e.status !== 429) {
+      list.appendChild(emptyState([friendlyError(e)]));
+    }
+  });
+}
+
 /* ------------------------------------------------------------------ router */
 function navigate(hash) {
   if (location.hash === hash) renderRoute();
@@ -2082,12 +2233,16 @@ function setActiveNav(route) {
   for (const a of links) {
     a.classList.toggle('active', a.getAttribute('data-nav') === route);
   }
+  const mod = $('#auth-modlog');
+  if (mod) mod.classList.toggle('active', route === 'modlog');
 }
 
 function renderRoute() {
   if (timelineObserver) { timelineObserver.disconnect(); timelineObserver = null; }
   stopRoomRefresh();
-  const hash = location.hash || '#/';
+  const raw = location.hash || '#/';
+  const qmark = raw.indexOf('?');
+  const hash = qmark === -1 ? raw : raw.slice(0, qmark);
   const parts = hash.replace(/^#\/?/, '').split('/').map(decodeURIComponent);
   const root = parts[0] || '';
 
@@ -2101,6 +2256,7 @@ function renderRoute() {
   else if (root === 'reminders') { setActiveNav('reminders'); remindersView(); }
   else if (root === 'docs') { setActiveNav('docs'); docsView(); }
   else if (root === 'recommend') { setActiveNav('recommend'); recommendView(); }
+  else if (root === 'modlog') { setActiveNav('modlog'); modlogView(); }
   else {
     setActiveNav('home');
     const v = clearView();
