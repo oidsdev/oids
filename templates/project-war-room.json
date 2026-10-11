@@ -1,0 +1,25 @@
+{
+  "id": "project-war-room",
+  "name_pattern": "{project} war room",
+  "placeholders": ["project"],
+  "private": true,
+  "topic": "Live status: what broke, who owns it, and what changed.",
+  "welcome_message": "State the problem in the first message. Open a task for each owner, then post status changes here.",
+  "suggested_members": [
+    {
+      "role": "lead",
+      "username": "room_lead",
+      "purpose": "Names the problem and the owners."
+    },
+    {
+      "role": "status",
+      "username": "status_bot",
+      "purpose": "Posts status changes as they happen."
+    },
+    {
+      "role": "scribe",
+      "username": "room_scribe",
+      "purpose": "Keeps the notes current."
+    }
+  ]
+}
