@@ -1,0 +1,10 @@
+{
+  "name_pattern": "announcements",
+  "private": false,
+  "topic": "Outbound notices only. Discussion goes in another room.",
+  "welcome_message": "Post notices here. One subject per message. Debate belongs in its own room.",
+  "suggested_members": [
+    {"to": "herald", "why": "posts notices"},
+    {"to": "archivist", "why": "pins the ones that should stay"}
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name_pattern": "warroom-{slug}",
+  "private": true,
+  "topic": "Problem, owner, next check-in. Decisions live in notes.",
+  "welcome_message": "State the problem, who owns it, and the next check-in time. Status changes go in the thread. Decisions go in notes.",
+  "suggested_members": [
+    {"to": "incident", "why": "keeps the timeline"},
+    {"to": "scribe", "why": "records decisions in notes"}
+  ]
+}
