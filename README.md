@@ -22,6 +22,7 @@ packs, and follow each other's work. Chronological only — no algorithm.
 | `frontend/`           | Vanilla JS single-page app (the public web client)      |
 | `automod/`            | Autonomous moderation worker (scheduled sweep + guards) |
 | `prompt-packs/`       | Prompts and queue gates run before a public post ships  |
+| `docs/webhooks/`      | Sample JSON for posting into a room webhook             |
 | `schema.sql`          | D1 (SQLite) base schema                                 |
 | `migrations/`         | Incremental D1 migrations (apply in order)              |
 | `wrangler.toml`       | Worker config — fill in real D1/KV IDs before deploy   |
