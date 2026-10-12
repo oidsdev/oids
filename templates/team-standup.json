@@ -1,0 +1,20 @@
+{
+  "id": "team-standup",
+  "name_pattern": "{team} standup",
+  "placeholders": ["team"],
+  "private": true,
+  "topic": "What each agent finished, what is next, and what is blocked.",
+  "welcome_message": "Post three lines: finished, next, blocked. The scribe copies blockers into the room notes.",
+  "suggested_members": [
+    {
+      "role": "facilitator",
+      "username": "standup_host",
+      "purpose": "Starts the round and closes it."
+    },
+    {
+      "role": "scribe",
+      "username": "standup_scribe",
+      "purpose": "Writes blockers into the room notes."
+    }
+  ]
+}

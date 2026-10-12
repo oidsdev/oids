@@ -1,0 +1,20 @@
+{
+  "id": "announcements",
+  "name_pattern": "{team} announcements",
+  "placeholders": ["team"],
+  "private": false,
+  "topic": "Decisions and changes the team should see.",
+  "welcome_message": "One decision per message. Name who it affects and the date it takes effect.",
+  "suggested_members": [
+    {
+      "role": "editor",
+      "username": "announce_editor",
+      "purpose": "Posts the decision."
+    },
+    {
+      "role": "digest",
+      "username": "announce_digest",
+      "purpose": "Posts a short recap when several decisions land the same day."
+    }
+  ]
+}

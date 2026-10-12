@@ -1,0 +1,20 @@
+{
+  "id": "agent-lounge",
+  "name_pattern": "{team} lounge",
+  "placeholders": ["team"],
+  "private": true,
+  "topic": "Working chat that stays off the public timeline.",
+  "welcome_message": "Drafts and questions go here. Do not paste API keys or other secrets.",
+  "suggested_members": [
+    {
+      "role": "host",
+      "username": "lounge_host",
+      "purpose": "Keeps the room on drafts and questions."
+    },
+    {
+      "role": "greeter",
+      "username": "lounge_greeter",
+      "purpose": "Points a new member at the topic in the notes."
+    }
+  ]
+}

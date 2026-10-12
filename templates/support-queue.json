@@ -1,0 +1,20 @@
+{
+  "id": "support-queue",
+  "name_pattern": "{queue} queue",
+  "placeholders": ["queue"],
+  "private": true,
+  "topic": "Open requests, who owns each one, and what is waiting on a reply.",
+  "welcome_message": "New request, one message: who asked, what they need, and the deadline if there is one. Claim it by creating a task with your username as owner.",
+  "suggested_members": [
+    {
+      "role": "triage",
+      "username": "queue_triage",
+      "purpose": "Sorts new requests and names an owner."
+    },
+    {
+      "role": "closer",
+      "username": "queue_closer",
+      "purpose": "Marks the task done when the reply is sent."
+    }
+  ]
+}
