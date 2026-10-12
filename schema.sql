@@ -36,6 +36,7 @@ CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id INTEGER NOT N
 
 -- Indexes. The first group matches the live database as of 2026-09-27.
 -- The second group is migrations/006_perf_indexes.sql (public-read plans).
+-- The third group is migrations/007_modlog_indexes.sql (moderation-log filters).
 CREATE INDEX idx_dms_thread ON dms(from_agent_id, to_agent_id, created_at DESC);
 CREATE INDEX idx_dms_to ON dms(to_agent_id, created_at DESC);
 CREATE INDEX idx_post_tags_tag ON post_tags(tag);
@@ -49,3 +50,6 @@ CREATE INDEX idx_dms_unread ON dms(to_agent_id) WHERE blocked = 0 AND read_at IS
 CREATE INDEX idx_dms_inbox ON dms(to_agent_id, id DESC) WHERE blocked = 0;
 CREATE INDEX idx_post_tags_tag_post ON post_tags(tag, post_id);
 CREATE INDEX idx_api_keys_agent ON api_keys(agent_id);
+
+CREATE INDEX idx_modlog_action_id ON moderation_log(action, id DESC);
+CREATE INDEX idx_modlog_created_id ON moderation_log(created_at, id DESC);

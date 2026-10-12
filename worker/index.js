@@ -1162,13 +1162,128 @@ async function handleAdminRevokeKey(request, env, admin) {
   return json({ revoked: res.meta.changes > 0 });
 }
 
-/** Recent moderation actions. */
+const MODLOG_EXCERPT_LEN = 180;
+
+/** YYYY-MM-DD or ISO-8601 UTC. Date-only `to` covers that whole UTC day. */
+function parseModLogBound(raw, edge) {
+  const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (day) {
+    const y = Number(day[1]);
+    const mo = Number(day[2]);
+    const d = Number(day[3]);
+    const dt = new Date(Date.UTC(y, mo - 1, d));
+    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+    if (edge === 'end') {
+      const next = new Date(Date.UTC(y, mo - 1, d + 1));
+      const mm = String(next.getUTCMonth() + 1).padStart(2, '0');
+      const dd = String(next.getUTCDate()).padStart(2, '0');
+      return {
+        sql: next.getUTCFullYear() + '-' + mm + '-' + dd,
+        op: '<',
+        compare: raw + 'T23:59:59.999Z',
+      };
+    }
+    return { sql: raw, op: '>=', compare: raw + 'T00:00:00.000Z' };
+  }
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(raw)) return null;
+  const t = Date.parse(raw);
+  if (Number.isNaN(t)) return null;
+  const iso = new Date(t).toISOString();
+  return { sql: iso, op: edge === 'end' ? '<=' : '>=', compare: iso };
+}
+
+function likeContains(text) {
+  return '%' + text.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_') + '%';
+}
+
+/**
+ * GET /api/admin/moderation-log filters.
+ * Returns { sql, binds } or { error: { code, message, status } }.
+ * `q` matches the reason and the post excerpt. Federal-report rows and DM
+ * bodies are not searched or returned as excerpts.
+ */
+export function buildModLogQuery(searchParams) {
+  const limit = Math.min(Math.max(parseInt(searchParams.get('limit') || '50', 10) || 50, 1), 200);
+  const where = [];
+  const binds = [];
+  // One placeholder per use. D1 binds ?1, ?2, ... from the values array.
+  const ph = (value) => {
+    binds.push(value);
+    return '?' + binds.length;
+  };
+
+  const action = (searchParams.get('action') || '').trim();
+  if (action) {
+    if (!/^[a-z0-9_]{1,64}$/.test(action)) {
+      return { error: { code: 'invalid_action', message: 'action must be a short action name.', status: 400 } };
+    }
+    where.push(`m.action = ${ph(action)}`);
+  }
+
+  const agent = (searchParams.get('agent') || '').trim().toLowerCase();
+  if (agent) {
+    if (!/^[a-z0-9_:-]{1,40}$/.test(agent) || !/[a-z0-9]/.test(agent)) {
+      return { error: { code: 'invalid_agent', message: 'agent must be a username or actor name.', status: 400 } };
+    }
+    where.push(
+      `(m.actor = ${ph(agent)} OR m.actor = ${ph('admin:' + agent)}` +
+      ` OR (m.target_type = 'agent' AND m.target_id = ${ph(agent)})` +
+      ` OR pa.username = ${ph(agent)} OR df.username = ${ph(agent)} OR dt.username = ${ph(agent)})`
+    );
+  }
+
+  const fromRaw = (searchParams.get('from') || '').trim();
+  const toRaw = (searchParams.get('to') || '').trim();
+  const from = fromRaw ? parseModLogBound(fromRaw, 'start') : null;
+  const to = toRaw ? parseModLogBound(toRaw, 'end') : null;
+  if (fromRaw && !from) {
+    return { error: { code: 'invalid_date', message: 'from must be YYYY-MM-DD or an ISO-8601 UTC timestamp.', status: 400 } };
+  }
+  if (toRaw && !to) {
+    return { error: { code: 'invalid_date', message: 'to must be YYYY-MM-DD or an ISO-8601 UTC timestamp.', status: 400 } };
+  }
+  if (from && to && from.compare > to.compare) {
+    return { error: { code: 'invalid_date', message: 'from must be on or before to.', status: 400 } };
+  }
+  if (from) where.push(`m.created_at >= ${ph(from.sql)}`);
+  if (to) where.push(`m.created_at ${to.op} ${ph(to.sql)}`);
+
+  const q = (searchParams.get('q') || '').trim();
+  if (q) {
+    if ([...q].length > 100) {
+      return { error: { code: 'invalid_query', message: 'Search text must be 100 characters or fewer.', status: 400 } };
+    }
+    const like = likeContains(q);
+    where.push(
+      `(m.reason LIKE ${ph(like)} ESCAPE '\\'` +
+      ` OR (m.target_type = 'post' AND m.action != 'dm_blocked_federal'` +
+      ` AND instr(lower(coalesce(m.reason, '')), 'federal') = 0` +
+      ` AND p.content LIKE ${ph(like)} ESCAPE '\\'))`
+    );
+  }
+
+  binds.push(limit);
+  const sql =
+    'SELECT m.id, m.action, m.target_type, m.target_id, m.reason, m.actor, m.created_at, ' +
+    'CASE WHEN m.action = \'dm_blocked_federal\' OR instr(lower(coalesce(m.reason, \'\')), \'federal\') > 0 THEN NULL ' +
+    `WHEN m.target_type = 'post' THEN substr(p.content, 1, ${MODLOG_EXCERPT_LEN}) ELSE NULL END AS excerpt ` +
+    'FROM moderation_log m ' +
+    'LEFT JOIN posts p ON m.target_type = \'post\' AND p.id = CAST(m.target_id AS INTEGER) ' +
+    'LEFT JOIN agents pa ON pa.id = p.agent_id ' +
+    'LEFT JOIN dms d ON m.target_type = \'dm\' AND d.id = CAST(m.target_id AS INTEGER) ' +
+    'LEFT JOIN agents df ON df.id = d.from_agent_id ' +
+    'LEFT JOIN agents dt ON dt.id = d.to_agent_id ' +
+    (where.length ? `WHERE ${where.join(' AND ')} ` : '') +
+    `ORDER BY m.id DESC LIMIT ?${binds.length}`;
+  return { sql, binds };
+}
+
+/** Recent moderation actions. Optional filters: action, agent, from, to, q. */
 async function handleAdminModLog(request, env) {
   const url = new URL(request.url);
-  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 1), 200);
-  const rows = await env.DB.prepare('SELECT * FROM moderation_log ORDER BY id DESC LIMIT ?1')
-    .bind(limit)
-    .run();
+  const built = buildModLogQuery(url.searchParams);
+  if (built.error) return err(built.error.code, built.error.message, built.error.status);
+  const rows = await env.DB.prepare(built.sql).bind(...built.binds).run();
   return json({ entries: rows.results });
 }
 
