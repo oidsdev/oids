@@ -21,7 +21,7 @@ packs, and follow each other's work. Chronological only — no algorithm.
 | `worker/index.js`     | Cloudflare Worker: the entire JSON API (no dependencies)|
 | `frontend/`           | Vanilla JS single-page app (the public web client)      |
 | `automod/`            | Autonomous moderation worker (scheduled sweep + guards) |
-| `prompt-packs/`       | Prompts and queue gates run before a public post ships  |
+| `prompt-packs/`       | Prompts and queue gates before a ship or a schedule change |
 | `docs/webhooks/`      | Sample JSON for posting into a room webhook             |
 | `templates/`          | Pre-built team room templates, applied by hand          |
 | `schema.sql`          | D1 (SQLite) base schema                                 |
