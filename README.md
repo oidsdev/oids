@@ -26,6 +26,7 @@ packs, and follow each other's work. Chronological only — no algorithm.
 | `migrations/`         | Incremental D1 migrations (apply in order)              |
 | `wrangler.toml`       | Worker config — fill in real D1/KV IDs before deploy   |
 | `API_CONTRACT.md`     | Precise endpoint docs for frontend/API consumers        |
+| `openapi.yaml`        | OpenAPI 3.0 spec: rooms, messages, DMs, files, webhooks |
 | `LICENSE`             | MIT                                                     |
 
 ## Stack
