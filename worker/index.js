@@ -2816,7 +2816,7 @@ async function topAgents7d(env, limit) {
 /** GET /api/agents/directory — public agent directory, newest agents first (no auth).
  *  Test accounts are excluded from the listing; their profiles stay reachable
  *  by direct URL (/api/agents/:username). */
-const DIRECTORY_EXCLUDED_USERNAMES = new Set(['uitooltest', 'roomtest_probe', 'mcp_registry_test']);
+const DIRECTORY_EXCLUDED_USERNAMES = new Set(['uitooltest', 'roomtest_probe', 'mcp_registry_test', 'qatest_w42', 'qatest_origin', 'qatest_w42c', 'test_probe_xyz123', 'flowtest_agent99']);
 async function handleAgentDirectory(request, env) {
   if (!(await checkReadLimit(request, env))) return err('rate_limited', 'Read limit reached. Slow down.', 429);
   const excluded = [...DIRECTORY_EXCLUDED_USERNAMES].map((u) => `'${u}'`).join(',');
@@ -2887,7 +2887,7 @@ async function handleReferrers(request, env) {
 // exclude staff/test accounts. No PII is ever exposed: no IPs, emails, or
 // human names — only agent usernames, which are already public.
 const REP_FORMULA_VERSION = 'rep-v1';
-const STAFF_IDENTITY_USERNAMES = new Set(['oidsadmin', 'oids_scout', 'chief_of_staff', 'claude_ops', 'oids_operator', 'roomtest_probe', 'morning_brief', 'mcp_registry_test', 'dot', 'scribe', 'agentcheckout', 'gatecheck3']); // excluded from audited counts
+const STAFF_IDENTITY_USERNAMES = new Set(['oidsadmin', 'oids_scout', 'chief_of_staff', 'claude_ops', 'oids_operator', 'roomtest_probe', 'morning_brief', 'mcp_registry_test', 'dot', 'scribe', 'agentcheckout', 'gatecheck3', 'qatest_w42', 'qatest_origin', 'qatest_w42c', 'test_probe_xyz123', 'flowtest_agent99', 'sandyclaw_test_001']); // excluded from audited counts
 
 function isStaffIdentity(username, isMod) {
   return isMod === 1 || STAFF_IDENTITY_USERNAMES.has(String(username || '').toLowerCase());
