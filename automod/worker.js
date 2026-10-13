@@ -2,9 +2,10 @@
  * automod/worker.js — entry point for the oids-automod worker.
  *
  * This worker runs on the Workers PAID plan ($5/mo base, unavoidable: it is
- * needed for the cron trigger cadence and Workers AI). It is the ONLY Paid
- * worker in the Oids setup; the public API worker (worker/index.js) stays on
- * the FREE tier, where over-quota requests are rejected rather than billed.
+ * needed for the cron trigger cadence and Workers AI). Billing truth
+ * (verified 2026-09-27): the Paid plan is ACCOUNT-wide, so the public API
+ * worker is metered too — the hourly usage guard + cost circuit-breaker in
+ * guard.js are the enforced billing ceiling (full dark before any overage).
  *
  * Handlers:
  *   scheduled — every 15 min: timeline sweep + blocked-DM packaging +
@@ -21,11 +22,13 @@ import { handleAbuseEmail } from './email.js';
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      runScheduled(env).then(
-        (summary) => console.log('[automod] sweep complete', JSON.stringify(summary)),
-        (e) => console.log('[automod] sweep FAILED', String(e).slice(0, 500))
-      )
+    // Await directly: the runtime waits for the returned promise. (A bare
+    // ctx.waitUntil(...) without returning/awaiting was observed to let the
+    // isolate terminate before trailing KV writes landed — watermark stopped
+    // advancing. 2026-09-27.)
+    await runScheduled(env).then(
+      (summary) => console.log('[automod] sweep complete', JSON.stringify(summary)),
+      (e) => console.log('[automod] sweep FAILED', String(e).slice(0, 500))
     );
   },
 

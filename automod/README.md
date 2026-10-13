@@ -6,16 +6,27 @@ Cloudflare, off metered agent usage.
 
 ## Architecture: two workers, one billable
 
-| Worker | Plan | Why |
-|---|---|---|
-| `oids` (public API, `../worker/index.js`) | **Free** | Over-quota requests are **rejected, not billed** — a hard billing cap by construction. No cron, no AI binding. |
-| `oids-automod` (`worker.js`, this dir) | **Paid ($5/mo base)** | Cron triggers + Workers AI require Paid. This is the **only** Paid surface. |
+| Worker | Why Paid matters |
+|---|---|
+| `oids` (public API, `../worker/index.js`) | Metered under the account's Workers Paid plan. Protected by the hourly usage guard + cost circuit-breaker (full dark before overage). |
+| `oids-automod` (`worker.js`, this dir) | Cron triggers + Workers AI require Paid. This is the worker that *needs* Paid; the plan itself is account-wide. |
 
 Both workers bind to the **same D1 database and KV namespace**. The automod
 worker has no public HTTP surface (`fetch` returns 404).
 
+**Billing truth (verified 2026-09-27):** the Workers Paid plan ($5/mo base)
+is per-**account**, not per-worker
+([docs](https://developers.cloudflare.com/workers/platform/pricing/):
+"a minimum charge of $5 USD per month for an account"). Once the account is
+on Paid (required for the automod cron + Workers AI), **all** workers in the
+account — including the public `oids` API worker — are metered against the
+10M requests/month included quota (+$0.30/M over). An earlier version of this
+doc claimed the public worker "stays on Free, rejected-not-billed"; that is
+**wrong** and has been corrected. The enforced billing ceiling is the guard
+below, not a plan tier.
+
 **Do NOT add `[triggers]` or `[ai]` to the public worker's wrangler.toml.**
-That would move API traffic onto the metered plan and defeat the billing design.
+That would add cron/AI cost surface for no benefit.
 
 ## Billing hardstop (`guard.js`)
 
@@ -29,12 +40,23 @@ guard builds one. It runs **hourly** inside the 15-minute cron:
    override with the `USAGE_WARN_THRESHOLD` var): urgent notification so a human
    looks at the traffic. Once per day.
 3. **KILL tier — 1,000,000 requests/day** (tunable: `USAGE_KILL_THRESHOLD_PER_DAY`,
-   override with the `USAGE_KILL_THRESHOLD` var): flips the shared KV kill
-   switch `oids:kill = "1"`. The API worker returns **HTTP 503 on every route**
-   while the flag is set. Recover with `../revive.sh` after reviewing the
-   flood source.
+   override with the `USAGE_KILL_THRESHOLD` var): **full dark** — flips BOTH
+   shared KV flags (`oids:kill = "1"` and `oids:dark = "1"`). The API worker
+   checks `oids:dark` first and returns **HTTP 404 on every route**. (Manual
+   `../kill.sh` sets only `oids:kill` → 503 "temporarily unavailable"; that is
+   the operator's explicit call, unchanged.)
 4. On **any** API error (bad token, missing permission, schema change) the
    guard **never flips the switch** — unknown state fails safe, not armed.
+
+**Cost circuit-breaker (primary, David 2026-09-27):** projects month-end
+metered spend from month-to-date usage + trailing-24h rate and goes full dark
+*before* any overage charge is incurred — trip when projected Workers
+requests exceed 90% of the 10M/month included, or projected total overage
+exceeds $1.00/month above the $5 base (tunable: `COST_KILL_USD`). **Two
+consecutive hourly trips are required** before going dark (first trip only
+arms a pending flag) — one-off anomalies never darken the site spuriously.
+A healthy projection clears the pending flag. See `guard.js` header for the
+full projection math and honest limits.
 
 Why these numbers: legitimate Oids traffic is plausibly under 100k/day, so
 1M/day is ~10x headroom. A sustained 1M/day flood is ~30M/month — roughly
@@ -67,14 +89,14 @@ AI spend is structurally unable to spike. (KV is eventually consistent, so a
 - Worst case before the hourly guard trips is bounded by the **1M/day kill
   threshold** (~$10 overage/month equivalent at sustained flood levels).
 
-## Operator's part: dashboard billing alerts (cannot be done via API)
+## David's part: dashboard billing alerts (cannot be done via API)
 
 The Cloudflare API does **not** expose usage/billing alert creation to this
 account's token (alerting API returns authentication errors; there is no
-`notification-policies` route), so this step needs the operator in the dashboard:
+`notification-policies` route), so this step needs David in the dashboard:
 
 1. Go to **dash.cloudflare.com** and select the account
-   (your Cloudflare account).
+   (Mrdavesemailaddress@gmail.com's Account).
 2. Top-right account menu → **Manage Account → Notifications** → create a
    **Budget alert**: set dollar thresholds (e.g. $10 and $25). These email
    when account-wide usage-based spend crosses the threshold.
@@ -93,8 +115,19 @@ path differs, look under Manage Account → Billing.
 Every 15 minutes (dry-run until cutover: `AUTOMOD_DRY_RUN="1"`):
 
 - **Federal tier first** — text-pattern screen (see `patterns.js`). Matches:
-  post soft-deleted, all account keys revoked, incident packaged in D1
-  `federal_incidents` (dry-run: `dry_run=1`, nothing deleted/revoked).
+  post soft-deleted, all account keys revoked, and a **DRAFT** incident
+  package written to D1 `federal_incidents`
+  (`status='pending'`, `review_status='awaiting_review'`; dry-run: `dry_run=1`,
+  nothing deleted/revoked).
+  **Policy (David, 2026-09-27): NOTHING goes to an outside authority on the
+  filter alone.** Filing the external report (NCMEC CyberTipline for
+  `kind='child'`, FBI tips for `kind='other'`) requires a HUMAN REVIEW step
+  first: Muse reviews the draft package (it contains everything needed for
+  prompt filing — verbatim content, timestamps, account identifiers, the
+  exact filing destination, and a review checklist), escalating to David when
+  uncertain. A false positive must never mean reporting an innocent account.
+  Filing itself is always done by a human through the official portal — never
+  automated. Review workflow: `./review-federal.sh list|show|confirm|dismiss|filed`.
   Text-pattern screening only — never describe it as comprehensive semantic,
   image, or CSAM detection.
 - **High-confidence abuse** (scam/pharma phrases, link spam, exact reposts of
@@ -104,7 +137,8 @@ Every 15 minutes (dry-run until cutover: `AUTOMOD_DRY_RUN="1"`):
   `review_queue` with an optional Workers AI verdict (llama-3.1-8b-instruct).
   **AI alone never deletes.**
 - **Blocked DMs**: DMs stopped by send-time federal screening are packaged
-  for filing.
+  as DRAFTs in `federal_incidents` for human review (same no-auto-filing
+  policy as above).
 - **DM watch**: new DMs to `@oidsadmin` → `notifications` (never marked read).
 - **Dox patterns** load from KV `automod:dox-patterns` — private, never
   committed.
@@ -130,8 +164,8 @@ python3 automod/drain-notifications.py   # exception-only; quiet when empty
 
 - NOTHING public reveals AI generation. Public admin is `@oidsadmin`;
   public abuse contact is `abuse@tryoids.com`.
-- Never expose the operator's real name, email, phone, address, location,
-  account IDs, or other PII — in code, logs, notifications, or UI copy.
+- Never expose David's real name, Gmail, phone, address, location, account
+  IDs, or other PII — in code, logs, notifications, or UI copy.
 - Preserve evidence via soft deletion. Synthetic federal incidents are never
   filed.
 - User-facing text must pass the humanizer gate (no em-dash sentence glue,
