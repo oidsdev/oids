@@ -1,6 +1,6 @@
 # Cutover Plan — Oids Autonomous Moderation
 
-**Do not deploy until the operator approves this plan.** Production is unchanged
+**Do not deploy until David approves this plan.** Production is unchanged
 until every step below is done in order. Nothing here is automated; each step
 needs a human go-ahead.
 
@@ -12,12 +12,12 @@ needs a human go-ahead.
       `oids` worker stays on **Free** (rejected-not-billed = hard cap).
       (API token could not verify the Workers subscription tier — needs the
       dashboard.)
-- [ ] **Billing alerts (operator, dashboard only).** The API cannot create
+- [ ] **Billing alerts (David, dashboard only).** The API cannot create
       usage/billing alerts (alerting API auth-errors on this token; no
-      notification-policies route). In the dashboard: dash.cloudflare.com → account →
+      notification-policies route). David: dash.cloudflare.com → account →
       **Manage Account → Notifications** → Budget alert ($10, $25) + optional
       Workers usage-based alert. Informational only; the worker guard is the
-      enforced ceiling. See README.md "Operator's part".
+      enforced ceiling. See README.md "David's part".
 
 ## Tokens and secrets (least privilege)
 
@@ -28,7 +28,7 @@ needs a human go-ahead.
 - [ ] Grant the **deploy token** only: Workers (oids-automod) edit, D1 edit,
       KV edit, Workers AI run, Email Routing edit. Nothing broader.
 - [ ] Optional notification fan-out: `wrangler secret put RESEND_API_KEY`
-      and set `NOTIFY_EMAIL` var — only if the operator supplies a key and
+      and set `NOTIFY_EMAIL` var — only if David supplies a key and
       destination. Otherwise the D1 queue + drain script is the sink.
 
 ## Data
@@ -36,6 +36,9 @@ needs a human go-ahead.
 - [ ] Apply migration to **production** D1:
       `wrangler d1 execute oids-db --remote --file automod/migrations/004_automod.sql`
       (adds `review_queue`, `federal_incidents`, `notifications`).
+- [ ] Apply `automod/migrations/005_federal_review.sql` (adds the human-review
+      gate columns to `federal_incidents`: `review_status` /
+      `reviewed_by` / `reviewed_at` / `review_note`).
 - [ ] Seed production KV watermarks at **current maxima** (posts, DMs,
       modlog) so the first sweep does not replay history.
 - [ ] Seed private dox patterns from `~/.oids-dox-patterns` into KV key
@@ -76,7 +79,8 @@ needs a human go-ahead.
 
 - [ ] Disable/reduce cron `oids-mod-sweep`.
 - [ ] Disable/reduce cron `oids-abuse-watch`.
-- [ ] Keep human handling for: federal browser filings, legal judgment,
+- [ ] Keep human handling for: federal report review + filing (never
+      automated — see the federal-DRAFT policy in README.md), legal judgment,
       deploys, exceptional key-review decisions.
 
 ## Rollback
