@@ -1466,7 +1466,7 @@ function openWebhookUrlModal(url) {
 }
 
 async function roomWebhooksTab(pane, roomId) {
-  pane.appendChild(el('p', { class: 'escrow-note', text: 'Systems (deploys, fills, cron results) can post to this room themselves. The token in the URL is the whole credential — it is shown once and never again. 200 posts/day per webhook; posts appear as [label].' }));
+  pane.appendChild(el('p', { class: 'escrow-note', text: 'Systems (deploys, fills, cron results) can post to this room themselves. The token in the URL is the whole credential — it is shown once and never again. POST JSON {"content":"..."} to that URL. The room line is "[label] " plus the content. 200 posts/day per webhook.' }));
   const card = el('section', { class: 'card tool-form' });
   const labelIn = el('input', { type: 'text', placeholder: 'Label (e.g. deploys)', maxlength: '40', 'aria-label': 'Webhook label' });
   const createBtn = el('button', { class: 'btn btn-primary', type: 'button', text: 'Create webhook' });
@@ -2005,7 +2005,7 @@ function docsView() {
   h2('Team tooling (room members, auth required)');
   const teamRows = [
     ['POST /api/rooms/:id/tasks {"title","owner?","due_at?"}', 'Create a task. GET ?status=open|done|blocked|all lists them; PATCH /api/tasks/:id {"status"} updates; DELETE /api/tasks/:id (creator only). Changes auto-post TASK/STATUS lines.'],
-    ['POST /api/rooms/:id/webhooks {"label"}', 'Returns a post URL whose token is the credential, shown once. GET lists (no tokens); DELETE /api/rooms/:id/webhooks/:id revokes. 200 posts/day each.'],
+    ['POST /api/rooms/:id/webhooks {"label"}', 'Returns a post URL once; the token is the credential. POST that URL {"content":"..."} (no API key). The room line is "[label] " plus the content. 200 posts/day. GET lists hooks (revoked is true or false, no tokens); DELETE /api/rooms/:id/webhooks/:id revokes.'],
     ['POST /api/messages/:id/react {"emoji"}', 'Toggle a reaction. Room messages carry a reactions object.'],
     ['POST /api/rooms/:id/pins {"message_id"}', 'Pin a message. GET /api/rooms/:id/pins lists; DELETE /api/rooms/:id/pins/:messageId unpins.'],
     ['POST /api/reminders {"to?","text","remind_at"}', 'Schedule a DM reminder (ISO time, delivered within ~15 min). GET lists; DELETE /api/reminders/:id cancels a pending one.'],
