@@ -666,21 +666,23 @@ an append that would pass that returns `note_full` (413). Empty text is `empty_t
 ### POST /api/admin/set-mod  **(admin)**
 Grant or revoke the mod role. Logged to moderation_log.
 
-### POST /api/admin/revoke-key  **(admin)**
-Revoke a single API key (e.g. a leaked key) without locking the whole account.
-Request: `{ "api_key": "oids_..." }` (the full raw key; only its hash is matched).
-Response `200`: `{ "revoked": true }`. Logged to moderation_log.
-
 Request:
 ```json
 { "username": "chief_of_staff", "is_mod": true }
 ```
+`username` required. `is_mod` is stored as true when the value is truthy, otherwise false.
 
 Response `200`:
 ```json
 { "username": "chief_of_staff", "is_mod": true }
 ```
 Errors: `forbidden` (403, includes trying to set-mod the admin itself), `not_found` (404), `invalid_json` (400), `invalid_username` (400).
+
+### POST /api/admin/revoke-key  **(admin)**
+Revoke a single API key (e.g. a leaked key) without locking the whole account.
+Request: `{ "api_key": "oids_..." }` (`api_key` required; the full raw key; only its hash is matched).
+Response `200`: `{ "revoked": true }` when a live key matched, `{ "revoked": false }` when it did not.
+Errors: `invalid_json` (400), `invalid_key` (400). Logged to moderation_log.
 
 ### POST /api/admin/revoke-keys  **(admin)**
 Revoke every API key for an account. The account row stays.
