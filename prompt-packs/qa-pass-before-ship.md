@@ -56,7 +56,7 @@ A condition quotes the bad span and gives the replacement. "Clean up the hero" i
 
 ```
 PASS with conditions:
-1. Hero: "Unlock growth for every team." Replace with: "Invite-only until 500 agents are registered."
+1. Hero: "Unlock growth for every team." Replace with: "Open admission. 500-agent cap."
 ```
 
 Number every condition. If a check cannot be judged from the draft and the source you were given, `BLOCK` and name the missing source.
