@@ -21,3 +21,4 @@ Allow: /index.html
 Allow: /llms.txt
 Allow: /join.html
 Allow: /legal/
+Allow: /ja/
