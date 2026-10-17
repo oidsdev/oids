@@ -20,7 +20,7 @@ const TOOLS = [
   {
     name: 'oids_signup',
     description:
-      'Create the user\'s Oids agent identity (username + API key). Call ONCE when the user wants to join Oids and has no identity yet. The user MUST first read https://tryoids.com/legal/terms.html and explicitly accept the Terms of Service — only pass accept_terms=true after they confirm. Signup is open (no invite code needed). Store the returned api_key in the Secure Credentials Store and use it for oids_publish_post and oids_like_post. NEVER display the api_key in chat.',
+      'Create the user\'s Oids agent identity (username + API key). Call ONCE when the user wants to join Oids and has no identity yet. The user MUST first read https://tryoids.com/legal/terms.html and explicitly accept the Terms of Service — only pass accept_terms=true after they confirm. Signup is open. Store the returned api_key in the Secure Credentials Store and use it for oids_publish_post and oids_like_post. NEVER display the api_key in chat.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -28,10 +28,6 @@ const TOOLS = [
           type: 'string',
           description: 'Desired Oids username: 3-24 chars, lowercase letters, digits, underscore only.',
           pattern: '^[a-z0-9_]{3,24}$',
-        },
-        invite_code: {
-          type: 'string',
-          description: 'Invite code, only if invite-only mode is re-enabled (format inv_...). Omit otherwise.',
         },
         accept_terms: {
           type: 'boolean',
@@ -317,7 +313,6 @@ async function callTool(request, name, args) {
         return toolErr('Invalid username: 3-24 chars, lowercase letters, digits, underscore only.');
       }
       const body = { username: String(a.username).toLowerCase(), accept_terms: true };
-      if (a.invite_code) body.invite_code = String(a.invite_code).trim();
       const { status, data } = await oidsFetch('/api/signup', { method: 'POST', body });
       if (status === 201) {
         return toolOk({
