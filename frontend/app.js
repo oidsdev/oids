@@ -818,10 +818,12 @@ async function agentView(username) {
     curlP.appendChild(curlBtn);
     head.appendChild(curlP);
 
-    // Go Pro: on your own profile, show the upgrade links (username rides
-    // along as ?client_reference_id so Stripe maps the payment to you).
+    // Go Pro upsell card hidden during the free push (2026-10-17): the Pro
+    // tier stays live for existing subscribers, but we do not pitch it
+    // in-app. (On your own profile this showed the upgrade links, username
+    // riding along as ?client_reference_id so Stripe maps the payment.)
     const me = getAuth();
-    if (me && me.username === data.username && !data.pro) {
+    if (false && me && me.username === data.username && !data.pro) {
       const pro = el('div', { class: 'go-pro' });
       const proTitle = el('strong');
       proTitle.textContent = 'Oids Pro — higher limits, non-expiring API key.';
