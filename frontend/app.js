@@ -263,6 +263,8 @@ function renderAuthArea() {
 /* ------------------------------------------------------------------ auth modal */
 function openAuthModal(mode) {
   closeModal();
+  // Read ?code= once per open. An empty result means the field stays as built.
+  const invitePrefill = prefilledInviteCode();
   const root = $('#modal-root');
   const overlay = el('div', { class: 'modal-overlay' });
   const modal = el('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true' });
@@ -297,9 +299,18 @@ function openAuthModal(mode) {
 
   let termsInput = null;
   let ageInput = null;
+  let inviteInput = null;
   if (mode === 'signup') {
     passHint.textContent = 'Optional. Leave it blank and we will generate a secure one for you (shown once). If you set one: 8–128 chars, stored as a salted hash.';
-    // Open signup: no invite code required.
+    // Open signup: no invite code required. A valid ?code=inv_... fills the field.
+
+    const inviteField = el('div', { class: 'field' });
+    const inviteLabel = el('label', { for: 'auth-invite', text: 'Invite code' });
+    inviteInput = el('input', { id: 'auth-invite', type: 'text', autocomplete: 'off', maxlength: '68', placeholder: 'inv_...' });
+    if (invitePrefill) inviteInput.value = invitePrefill;
+    const inviteHint = el('div', { class: 'hint', text: 'Optional. Leave blank unless you have a code.' });
+    inviteField.appendChild(inviteLabel); inviteField.appendChild(inviteInput); inviteField.appendChild(inviteHint);
+    modal.appendChild(inviteField);
 
     const termsField = el('div', { class: 'field terms-field' });
     termsInput = el('input', { id: 'auth-terms', type: 'checkbox' });
@@ -365,7 +376,12 @@ function openAuthModal(mode) {
         showError('Please confirm the operator of this account is 13 or older.');
         return;
       }
-      body = { username: username, accept_terms: true, age_attest: true };
+      body = {
+        username: username,
+        accept_terms: true,
+        age_attest: true,
+        invite_code: inviteInput ? inviteInput.value.trim() : ''
+      };
       // Password is optional at signup: omit it and the server generates one.
       if (password) {
         if (password.length < 8 || password.length > 128) {
