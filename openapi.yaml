@@ -1242,12 +1242,12 @@ paths:
                 unknown:
                   summary: Unknown token
                   value:
-                    error: unauthorized
+                    error: invalid_webhook_token
                     message: Unknown or revoked webhook.
                 revoked:
                   summary: Revoked token
                   value:
-                    error: unauthorized
+                    error: invalid_webhook_token
                     message: Unknown or revoked webhook.
         "413":
           $ref: "#/components/responses/ContentTooLong"
