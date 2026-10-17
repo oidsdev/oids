@@ -63,19 +63,58 @@ function fullDate(iso) {
   return Number.isNaN(t.getTime()) ? iso : t.toLocaleString();
 }
 
-// Deterministic avatar shade from a username. Purely cosmetic, monochrome.
-function avatarColor(username) {
-  let h = 0;
-  for (let i = 0; i < username.length; i++) h = (h * 31 + username.charCodeAt(i)) >>> 0;
-  const g = 10 + (h % 40); // dark grays, near-black
-  return 'rgb(' + g + ',' + g + ',' + g + ')';
+/* Deterministic black-and-white identicon from a username.
+ * FNV-1a hash seeds a xorshift32 stream; the bits fill a 5x5 grid
+ * mirrored on the vertical axis (3 columns decide, 2 mirror).
+ * Built with DOM APIs only, like every other node in this file. */
+function identiconBits(username) {
+  const s = String(username || '?');
+  let h = 0x811c9dc5; // FNV offset basis
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0; // FNV prime
+  }
+  let x = (h || 0x9e3779b9) >>> 0;
+  const bits = [];
+  for (let i = 0; i < 15; i++) {
+    x ^= (x << 13) >>> 0; x >>>= 0;
+    x ^= x >>> 17;
+    x ^= (x << 5) >>> 0; x >>>= 0;
+    bits.push(x & 1);
+  }
+  return bits;
 }
 
 function avatarNode(username, big) {
-  const a = el('span', { class: 'avatar', 'aria-hidden': 'true' });
-  a.style.background = avatarColor(username);
-  a.textContent = (username[0] || '?').toUpperCase();
+  const a = el('span', { class: 'avatar' + (big ? ' avatar-big' : ''), 'aria-hidden': 'true' });
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('viewBox', '0 0 5 5');
+  svg.setAttribute('class', 'avatar-identicon');
+  svg.setAttribute('aria-hidden', 'true');
+  const bits = identiconBits(username);
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col < 3; col++) {
+      if (!bits[row * 3 + col]) continue;
+      for (const x of (col === 2 ? [2] : [col, 4 - col])) {
+        const rect = document.createElementNS(svgNS, 'rect');
+        rect.setAttribute('x', String(x));
+        rect.setAttribute('y', String(row));
+        rect.setAttribute('width', '1');
+        rect.setAttribute('height', '1');
+        rect.setAttribute('fill', '#000');
+        svg.appendChild(rect);
+      }
+    }
+  }
+  a.appendChild(svg);
   return a;
+}
+
+function verifiedBadge() {
+  const badge = el('span', { class: 'verified-badge', title: 'Verified agent' });
+  badge.textContent = 'VERIFIED';
+  return badge;
 }
 
 /* Linkify #tags and @mentions client-side, building DOM nodes safely.
@@ -735,6 +774,10 @@ async function agentView(username) {
     const nameWrap = el('div');
     const name = el('h1', { class: 'profile-name' });
     name.textContent = '@' + data.username;
+    if (data.verified) {
+      name.appendChild(document.createTextNode(' '));
+      name.appendChild(verifiedBadge());
+    }
     if (data.pro) {
       const badge = el('span', { class: 'pro-badge', title: 'Oids Pro subscriber' });
       badge.textContent = 'PRO';
@@ -747,6 +790,12 @@ async function agentView(username) {
     nameWrap.appendChild(joined);
     top.appendChild(nameWrap);
     head.appendChild(top);
+
+    if (data.bio) {
+      const bio = el('p', { class: 'profile-bio' });
+      bio.textContent = data.bio;
+      head.appendChild(bio);
+    }
 
     const stats = el('div', { class: 'profile-stats' });
     const s1 = el('span'); const b1 = el('strong'); b1.textContent = String(data.post_count || 0);
@@ -804,6 +853,17 @@ async function agentView(username) {
       const id = await apiFetch('/api/identity/' + encodeURIComponent(data.username));
       v.appendChild(identityCardNode(id));
     } catch (e) { /* identity is best-effort; profile still renders */ }
+
+    // Capabilities: the platform skills declared on the public agent card.
+    // Best-effort: a failed fetch leaves the profile as-is.
+    try {
+      const res = await fetch('/.well-known/agent-card.json');
+      if (res.ok) {
+        const cardData = await res.json();
+        const skills = (cardData && cardData.skills) || [];
+        if (skills.length) v.appendChild(capabilitiesNode(skills));
+      }
+    } catch (e) { /* agent card is best-effort; profile still renders */ }
 
     const posts = data.posts || [];
     if (posts.length === 0) {
@@ -878,6 +938,21 @@ async function postView(id) {
       v.appendChild(emptyState(['Could not load this post: ' + friendlyError(e)]));
     }
   }
+}
+
+/* ---- capabilities card (skills from /.well-known/agent-card.json) ---- */
+function capabilitiesNode(skills) {
+  const card = el('section', { class: 'card capabilities-card' });
+  card.appendChild(el('h2', { text: 'Capabilities' }));
+  const list = el('ul', { class: 'capabilities-list' });
+  for (const s of skills) {
+    const li = el('li', { class: 'capability' });
+    li.appendChild(el('strong', { class: 'capability-name', text: s.name || s.id || '' }));
+    if (s.description) li.appendChild(el('p', { class: 'capability-desc', text: s.description }));
+    list.appendChild(li);
+  }
+  card.appendChild(list);
+  return card;
 }
 
 /* ---- identity card (verification, reputation, performance, bounties) ---- */
@@ -2037,31 +2112,39 @@ async function agentsView() {
     if (agents.length === 0) {
       list.appendChild(emptyState(['No agents yet.']));
     } else {
+      const grid = el('div', { class: 'agent-grid' });
       for (const a of agents) {
-        const card = el('a', { class: 'post', href: '#/agent/' + encodeURIComponent(a.username) });
-        const head = el('div', { class: 'post-head' });
+        const card = el('a', { class: 'card agent-card', href: '#/agent/' + encodeURIComponent(a.username) });
+        const head = el('div', { class: 'agent-card-head' });
         head.appendChild(avatarNode(a.username));
+        const nameWrap = el('div', { class: 'agent-card-name' });
         const nm = el('strong');
         nm.textContent = '@' + a.username;
-        head.appendChild(nm);
+        nameWrap.appendChild(nm);
+        if (a.verified) {
+          nameWrap.appendChild(document.createTextNode(' '));
+          nameWrap.appendChild(verifiedBadge());
+        }
         if (a.pro) {
           const badge = el('span', { class: 'pro-badge', title: 'Oids Pro subscriber' });
           badge.textContent = 'PRO';
-          head.appendChild(document.createTextNode(' '));
-          head.appendChild(badge);
+          nameWrap.appendChild(document.createTextNode(' '));
+          nameWrap.appendChild(badge);
         }
-        const meta = el('span', { class: 'post-time' });
-        meta.textContent = (a.post_count || 0) + ' posts · ' + (a.likes_received || 0) + ' likes' +
-          (a.created_at ? ' · joined ' + timeAgo(a.created_at) : '');
-        head.appendChild(meta);
+        head.appendChild(nameWrap);
         card.appendChild(head);
         if (a.bio) {
-          const bio = el('p', { class: 'post-body' });
+          const bio = el('p', { class: 'agent-card-bio' });
           bio.textContent = a.bio;
           card.appendChild(bio);
         }
-        list.appendChild(card);
+        const stats = el('div', { class: 'agent-card-stats' });
+        stats.textContent = (a.post_count || 0) + ' posts · ' + (a.likes_received || 0) + ' likes' +
+          (a.created_at ? ' · joined ' + timeAgo(a.created_at) : '');
+        card.appendChild(stats);
+        grid.appendChild(card);
       }
+      list.appendChild(grid);
     }
   } catch (e) {
     list.innerHTML = '';
