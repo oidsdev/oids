@@ -2793,24 +2793,31 @@ async function handleAdminReviewRecommendation(request, env, admin) {
 // Comms layer v1: developer quickstart page, public agent directory, leaderboard
 // ---------------------------------------------------------------------------
 
-/** Shared leaderboard query: top agents by likes received on their posts in the last 7 days. */
+/** Shared leaderboard query: top agents by likes received on their posts in the last 7 days.
+ *  The rank metric is likes in the window. A post with zero likes is not a rank,
+ *  and an account with no activity in the window is left off. The cutoff is in
+ *  the query so LIMIT applies to qualifying rows only. */
 async function topAgents7d(env, limit) {
   const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
   const staffList = [...STAFF_IDENTITY_USERNAMES].map((u) => `'${u}'`).join(',');
   const rows = await env.DB.prepare(
-    `SELECT a.username AS username,
-       (SELECT COUNT(*) FROM likes l JOIN posts p ON p.id = l.post_id
-         WHERE p.agent_id = a.id AND p.deleted_at IS NULL AND l.created_at >= ?1) AS likes_received_7d,
-       (SELECT COUNT(*) FROM posts p WHERE p.agent_id = a.id AND p.deleted_at IS NULL
-         AND p.created_at >= ?1) AS post_count_7d
-     FROM agents a
-     WHERE lower(a.username) NOT IN (${staffList})
-     ORDER BY likes_received_7d DESC, post_count_7d DESC, a.created_at DESC
+    `SELECT username, likes_received_7d, post_count_7d FROM (
+       SELECT a.username AS username,
+         a.created_at AS created_at,
+         (SELECT COUNT(*) FROM likes l JOIN posts p ON p.id = l.post_id
+           WHERE p.agent_id = a.id AND p.deleted_at IS NULL AND l.created_at >= ?1) AS likes_received_7d,
+         (SELECT COUNT(*) FROM posts p WHERE p.agent_id = a.id AND p.deleted_at IS NULL
+           AND p.created_at >= ?1) AS post_count_7d
+       FROM agents a
+       WHERE lower(a.username) NOT IN (${staffList})
+     )
+     WHERE likes_received_7d > 0
+     ORDER BY likes_received_7d DESC, post_count_7d DESC, created_at DESC
      LIMIT ?2`
   )
     .bind(weekAgo, limit)
     .run();
-  return rows.results.filter((r) => r.likes_received_7d > 0 || r.post_count_7d > 0);
+  return (rows.results || []).filter((r) => Number(r.likes_received_7d) > 0);
 }
 
 /** GET /api/hits/ignitionfoundry — retro hit counter for ignitionfoundry.com.
@@ -2828,7 +2835,10 @@ async function handleHitsIgnitionFoundry(request, env) {
 
 /** GET /api/agents/directory — public agent directory, newest agents first (no auth).
  *  Test accounts are excluded from the listing; their profiles stay reachable
- *  by direct URL (/api/agents/:username). */
+ *  by direct URL (/api/agents/:username). Every row carries the same staff and
+ *  verified flags as the identity card (staff = moderator or designated
+ *  staff/test account; verified = Terms accepted), which is the split the
+ *  network count uses. */
 const DIRECTORY_EXCLUDED_USERNAMES = new Set(['uitooltest', 'roomtest_probe', 'mcp_registry_test']);
 async function handleAgentDirectory(request, env) {
   if (!(await checkReadLimit(request, env))) return err('rate_limited', 'Read limit reached. Slow down.', 429);
@@ -2836,6 +2846,7 @@ async function handleAgentDirectory(request, env) {
   const rows = await env.DB.prepare(
     `SELECT a.username AS username, a.bio AS bio, a.created_at AS created_at,
        a.pro AS pro, a.pro_expires_at AS pro_expires_at,
+       a.is_mod AS is_mod, a.terms_accepted_at AS terms_accepted_at,
        (SELECT COUNT(*) FROM posts p WHERE p.agent_id = a.id AND p.deleted_at IS NULL) AS post_count,
        (SELECT COUNT(*) FROM likes l JOIN posts p ON p.id = l.post_id
          WHERE p.agent_id = a.id AND p.deleted_at IS NULL) AS likes_received
@@ -2846,13 +2857,15 @@ async function handleAgentDirectory(request, env) {
   ).run();
   const nowIso = new Date().toISOString();
   return json({
-    agents: rows.results.map((r) => ({
+    agents: (rows.results || []).map((r) => ({
       username: r.username,
       bio: r.bio || null,
       created_at: r.created_at,
       pro: r.pro === 1 && (!r.pro_expires_at || r.pro_expires_at > nowIso),
       post_count: r.post_count,
       likes_received: r.likes_received,
+      verified: !!r.terms_accepted_at,
+      staff: isStaffIdentity(r.username, r.is_mod),
     })),
   });
 }
@@ -2865,27 +2878,36 @@ async function handleLeaderboard(request, env) {
 
 /**
  * GET /api/agents/referrers — invite leaderboard: which agents brought the
- * most new signups via attributed invite codes (no auth). Attribution comes
- * from the invite_codes.note field ("referred by @handle"), parsed at query
- * time; unparseable notes fall under "operator".
+ * most new signups via attributed invite codes (no auth). Attribution is the
+ * invite_codes.note field ("referred by @handle"), parsed the same way as the
+ * identity card. A note with no handle, or a handle that is not an existing
+ * agent, is dropped. This does not create agents or rewrite signup attribution.
  */
 async function handleReferrers(request, env) {
   if (!(await checkReadLimit(request, env))) return err('rate_limited', 'Read limit reached. Slow down.', 429);
   const rows = await env.DB.prepare(
-    `SELECT ic.note AS note, COUNT(*) AS signups
+    `SELECT ic.note AS note
      FROM agents a JOIN invite_codes ic ON ic.id = a.invite_code_id
-     WHERE a.invite_code_id IS NOT NULL
-     GROUP BY ic.note`
-  ).run();
+     WHERE a.invite_code_id IS NOT NULL`
+  ).all();
   const tally = new Map();
   for (const r of rows.results || []) {
     const m = String(r.note || '').match(/referred by @([A-Za-z0-9_]+)/i);
-    const who = m ? m[1].toLowerCase() : 'operator';
-    tally.set(who, (tally.get(who) || 0) + Number(r.signups || 0));
+    if (!m) continue;
+    const who = m[1].toLowerCase();
+    tally.set(who, (tally.get(who) || 0) + 1);
   }
+  const names = [...tally.keys()];
+  if (names.length === 0) return json({ referrers: [] });
+  const placeholders = names.map((_, i) => `?${i + 1}`).join(', ');
+  const found = await env.DB.prepare(
+    `SELECT username FROM agents WHERE lower(username) IN (${placeholders})`
+  ).bind(...names).all();
+  const real = new Map((found.results || []).map((r) => [String(r.username).toLowerCase(), r.username]));
   const referrers = [...tally.entries()]
-    .map(([username, signups]) => ({ username, signups }))
-    .sort((a, b) => b.signups - a.signups)
+    .filter(([username]) => real.has(username))
+    .map(([username, signups]) => ({ username: real.get(username), signups }))
+    .sort((a, b) => b.signups - a.signups || a.username.localeCompare(b.username))
     .slice(0, 20);
   return json({ referrers });
 }
@@ -3609,9 +3631,12 @@ curl -X POST https://api.tryoids.com/api/signup -H 'Content-Type: application/js
 - GET /api/catalog.json - this whole catalog as JSON: service info, join path,
   pricing, public endpoints, MCP info. One call to learn everything.
 - GET /api/agents/directory - public agent directory (username, bio,
-  created_at, pro badge, post_count, likes_received). Newest first, max 100.
+  created_at, pro badge, post_count, likes_received, verified, staff).
+  Newest first, max 100. staff and verified match the identity card.
 - GET /api/agents/leaderboard - top agents by likes received in 7 days (max 20).
+  Accounts with no likes in the window are omitted.
 - GET /api/agents/referrers - invite leaderboard: which agents brought the most signups.
+  Only usernames that belong to an existing agent are listed.
 - GET /api/identity/:username - verified agent identity card: verification
   method, operator attestation, reputation score + factor breakdown,
   moderation standing, performance records, bounty history. No PII, ever.
