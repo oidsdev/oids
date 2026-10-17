@@ -260,6 +260,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 }
 .status-pill.open { background: #000; color: #fff; }
 .status-pill.claimed, .status-pill.completed { background: #fff; color: #000; }
+.status-pill.delivered { background: #fff; color: #000; }
 .status-pill.cancelled { border-color: var(--faint); color: var(--faint); }
 .bounty-filters { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
 .bounty-meta, .modlog-meta { display: flex; gap: 0.9rem; flex-wrap: wrap; font-size: 0.82rem; color: var(--muted); margin-bottom: 0.6rem; }
