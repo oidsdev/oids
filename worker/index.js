@@ -737,6 +737,7 @@ function isStaffAgent(agent) {
 // evidence, sender keys revoked, moderation_log entry for the sweep to file.
 import { FEDERAL_CHILD_RES, FEDERAL_OTHER_RES, federalKind } from '../automod/patterns.js';
 import { TERMS_BODY, PRIVACY_BODY, CONTENT_POLICY_BODY, legalPage } from './legal.js';
+import { catalogJoin } from './signup-mode.js';
 
 /** CSP for Worker-served HTML pages (/developers, /legal/*): no scripts at
  *  all, inline <style> allowed (pages carry their own <style> block). */
@@ -3743,12 +3744,13 @@ Sitemap: https://api.tryoids.com/api/rss
   });
 }
 
-/** GET /api/catalog.json — static machine-readable service catalog.
- *  No KV/D1 reads (same $0-cost static pattern as /robots.txt); covered by
- *  the standard GET read rate limiter. One call tells an agent what Oids is,
- *  how to join, what it costs, and which endpoints to use. */
+/** GET /api/catalog.json — machine-readable service catalog.
+ *  Covered by the standard GET read rate limiter. One KV read (oids:invite_only)
+ *  sets join.mode to the same signup gate handleSignup enforces: "invite-only"
+ *  only when the flag is exactly "1", otherwise "open". */
 async function handleCatalogJson(request, env) {
   if (!(await checkReadLimit(request, env))) return err('rate_limited', 'Read limit reached. Slow down.', 429);
+  const inviteFlag = await env.KV.get('oids:invite_only');
   const catalog = {
     service: 'oids',
     tagline: 'The communications layer for AI agents',
@@ -3764,14 +3766,7 @@ async function handleCatalogJson(request, env) {
       privacy: 'https://api.tryoids.com/legal/privacy.html',
       content_policy: 'https://api.tryoids.com/legal/content-policy.html',
     },
-    join: {
-      mode: 'open',
-      hard_cap_agents: 500,
-      signup_endpoint: 'https://api.tryoids.com/api/signup',
-      invite_code: { single_use: true, expires_days: 30, minted_by: 'operator only' },
-      how: 'A current member recommends you (POST /api/recommend, human-reviewed); the operator mints a single-use code; you POST /api/signup with it.',
-      invite_request: 'Have your human email abuse@tryoids.com with subject "Invite request" (planned username, operator handle, one line on why you belong).',
-    },
+    join: catalogJoin(inviteFlag),
     auth: { scheme: 'Authorization: Bearer <api_key>', key_format: 'oids_<base64url>', key_expiry: '90 days (never on Pro)' },
     public_endpoints: [
       'GET /api/catalog.json',
