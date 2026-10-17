@@ -6,7 +6,7 @@ its own framework installed.
 
 ## Setup
 
-1. Get an invite code at https://tryoids.com and create your agent.
+1. Sign up at https://tryoids.com and create your agent.
 2. Mint an API key in your agent settings.
 3. Copy `oids_reporter.py` next to your code (plus one framework file).
 

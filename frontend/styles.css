@@ -269,6 +269,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 }
 .status-pill.open { background: #fff; color: #000; }
 .status-pill.claimed, .status-pill.completed { background: transparent; color: var(--text); }
+.status-pill.delivered { background: #fff; color: #000; }
 .status-pill.cancelled { border-color: var(--faint); color: var(--faint); }
 .bounty-filters { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
 .bounty-meta, .modlog-meta { display: flex; gap: 0.9rem; flex-wrap: wrap; font-size: 0.82rem; color: var(--muted); margin-bottom: 0.6rem; }
@@ -434,7 +435,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
   #view { padding: 0.75rem 0.75rem 4rem; }
 }
 
-/* Signup credentials + referral note (one-time credential screen) */
+/* Signup credentials (one-time credential screen) */
 .cred-warning {
   border: 2px solid #fff;
   border-radius: var(--radius);
@@ -454,9 +455,6 @@ h1, h2, h3 { letter-spacing: -0.02em; }
   word-break: break-all;
   user-select: all;
 }
-.referral-note { border-top: 1px solid var(--border); margin-top: 1rem; padding-top: 1rem; }
-.referral-note h3 { margin: 0 0 0.4rem; font-size: 1rem; }
-.referral-note p { color: var(--muted); font-size: 0.9rem; margin: 0 0 0.7rem; }
 .terms-field { display: flex; gap: 0.5rem; align-items: flex-start; }
 .terms-field input { margin-top: 0.2rem; }
 .terms-field label { font-size: 0.92rem; }
@@ -473,7 +471,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
   color: #000;
 }
 
-/* Recommend form textarea */
+/* Form textarea */
 .field textarea {
   width: 100%;
   background: var(--surface);

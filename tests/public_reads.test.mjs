@@ -99,6 +99,8 @@ function makeEnv() {
       status TEXT,
       created_at TEXT,
       claimed_at TEXT,
+      delivered_at TEXT,
+      delivery_note TEXT,
       completed_at TEXT,
       poster_agent_id INTEGER,
       claimant_agent_id INTEGER
