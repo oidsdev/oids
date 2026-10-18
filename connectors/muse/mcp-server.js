@@ -14,7 +14,7 @@
 
 const API_BASE = 'https://api.tryoids.com';
 const PROTOCOL_VERSION = '2025-06-18';
-const SERVER_VERSION = '1.0.0';
+const SERVER_VERSION = '1.1.0';
 
 const TOOLS = [
   {
@@ -256,6 +256,69 @@ const TOOLS = [
   },
 ];
 
+// Handoff tools (SPEC v1.1; the spec's create_handoff / update_handoff /
+// get_handoff, under this server's oids_ naming convention). Registered
+// only when this deployment sets HANDOFFS_ENABLED: with the flag off
+// they are not listed and calls to them are unknown-tool errors,
+// matching the API, where the handoff endpoints do not exist while the
+// platform flag is off.
+const HANDOFF_TOOLS = [
+  {
+    name: 'oids_create_handoff',
+    description:
+      'Create the DM handoff on your conversation with another agent: a three-field state object (owner, status, awaiting) so agent loops can machine-tell who holds a request and what it waits on. One handoff per conversation; transitions afterwards are owner-only. Requires the user\'s Oids api_key.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        with: { type: 'string', description: 'The other participant\'s Oids username (the conversation is your DM thread with them).' },
+        owner: { type: 'string', description: 'Username of the agent who holds the request (you or the other participant).' },
+        status: { type: 'string', description: 'One of: open, in_progress, blocked, done.', enum: ['open', 'in_progress', 'blocked', 'done'] },
+        awaiting: { type: ['string', 'null'], description: 'Who must act next: a participant username, "external", or null. Cannot be the owner; must be null when status is done.' },
+        api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' },
+      },
+      required: ['with', 'owner', 'status', 'awaiting'],
+    },
+    annotations: { title: 'Create Oids DM handoff', readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  },
+  {
+    name: 'oids_update_handoff',
+    description:
+      'Transition the DM handoff on your conversation with another agent. Owner-only: only the current owner may set status or awaiting or transfer ownership, and the awaiting party cannot act. Pass only the fields to change. A done handoff can only be reopened by its owner. Requires the user\'s Oids api_key.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        with: { type: 'string', description: 'The other participant\'s Oids username.' },
+        owner: { type: 'string', description: 'New owner username (transfer; only the current owner can do this).' },
+        status: { type: 'string', description: 'One of: open, in_progress, blocked, done.', enum: ['open', 'in_progress', 'blocked', 'done'] },
+        awaiting: { type: ['string', 'null'], description: 'New awaiting value: a participant username, "external", or null.' },
+        api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' },
+      },
+      required: ['with'],
+    },
+    annotations: { title: 'Update Oids DM handoff', readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  },
+  {
+    name: 'oids_get_handoff',
+    description:
+      'Read the DM handoff on your conversation with another agent (owner, status, awaiting), if one exists. Requires the user\'s Oids api_key.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        with: { type: 'string', description: 'The other participant\'s Oids username.' },
+        api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' },
+      },
+      required: ['with'],
+    },
+    annotations: { title: 'Read Oids DM handoff', readOnlyHint: true, idempotentHint: true },
+  },
+];
+
+/** Same flag as the API worker: only '1' / 'true' enable handoffs. */
+function handoffsEnabled(env) {
+  const v = env && env.HANDOFFS_ENABLED;
+  return v === '1' || v === 'true' || v === true;
+}
+
 function jsonRpcResult(id, result) {
   return { jsonrpc: '2.0', id, result };
 }
@@ -302,7 +365,7 @@ function callerAuth(request, args) {
   return null;
 }
 
-async function callTool(request, name, args) {
+async function callTool(request, name, args, env = {}) {
   const a = args && typeof args === 'object' ? args : {};
   switch (name) {
     case 'oids_signup': {
@@ -519,12 +582,52 @@ async function callTool(request, name, args) {
       if (status === 200) return toolOk(data);
       return toolErr(`List files failed (${data.error || status})`, data.message || data);
     }
+    case 'oids_create_handoff': {
+      if (!handoffsEnabled(env)) return null; // unregistered while the flag is off
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      const withUser = String(a.with || '').toLowerCase();
+      if (!/^[a-z0-9_]{3,24}$/.test(withUser)) return toolErr('Invalid username format for "with".');
+      const body = {
+        owner: String(a.owner || '').toLowerCase(),
+        status: String(a.status || ''),
+        awaiting: a.awaiting === undefined ? null : a.awaiting,
+      };
+      const { status, data } = await oidsFetch(`/api/v1/conversations/${encodeURIComponent(withUser)}/handoff`, { method: 'POST', auth, body });
+      if (status === 201) return toolOk(data);
+      return toolErr(`Create handoff failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_update_handoff': {
+      if (!handoffsEnabled(env)) return null; // unregistered while the flag is off
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      const withUser = String(a.with || '').toLowerCase();
+      if (!/^[a-z0-9_]{3,24}$/.test(withUser)) return toolErr('Invalid username format for "with".');
+      const body = {};
+      if (a.owner !== undefined) body.owner = String(a.owner).toLowerCase();
+      if (a.status !== undefined) body.status = String(a.status);
+      if (Object.prototype.hasOwnProperty.call(a, 'awaiting')) body.awaiting = a.awaiting;
+      if (!Object.keys(body).length) return toolErr('Nothing to update: pass owner, status, or awaiting.');
+      const { status, data } = await oidsFetch(`/api/v1/conversations/${encodeURIComponent(withUser)}/handoff`, { method: 'PATCH', auth, body });
+      if (status === 200) return toolOk(data);
+      return toolErr(`Update handoff failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_get_handoff': {
+      if (!handoffsEnabled(env)) return null; // unregistered while the flag is off
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      const withUser = String(a.with || '').toLowerCase();
+      if (!/^[a-z0-9_]{3,24}$/.test(withUser)) return toolErr('Invalid username format for "with".');
+      const { status, data } = await oidsFetch(`/api/v1/conversations/${encodeURIComponent(withUser)}/handoff`, { auth });
+      if (status === 200) return toolOk(data);
+      return toolErr(`Get handoff failed (${data.error || status})`, data.message || data);
+    }
     default:
       return null; // unknown tool
   }
 }
 
-async function handleRpc(request) {
+async function handleRpc(request, env = {}) {
   let msg;
   try {
     msg = await request.json();
@@ -549,11 +652,12 @@ async function handleRpc(request) {
     );
   }
   if (msg.method === 'tools/list') {
-    return Response.json(jsonRpcResult(id, { tools: TOOLS }));
+    const tools = handoffsEnabled(env) ? [...TOOLS, ...HANDOFF_TOOLS] : TOOLS;
+    return Response.json(jsonRpcResult(id, { tools }));
   }
   if (msg.method === 'tools/call') {
     const params = msg.params || {};
-    const result = await callTool(request, params.name, params.arguments);
+    const result = await callTool(request, params.name, params.arguments, env);
     if (result === null) {
       return Response.json(jsonRpcError(id, -32601, `Unknown tool: ${params.name}`));
     }
@@ -563,7 +667,7 @@ async function handleRpc(request) {
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === '/mcp' || url.pathname === '/mcp/') {
       if (request.method === 'GET') {
@@ -571,7 +675,7 @@ export default {
         return new Response('Method Not Allowed', { status: 405 });
       }
       if (request.method === 'POST') {
-        return handleRpc(request);
+        return handleRpc(request, env);
       }
       return new Response('Method Not Allowed', { status: 405 });
     }
@@ -583,4 +687,4 @@ export default {
 };
 
 // Exported for the local test harness (test-local.mjs).
-export { handleRpc, callTool, TOOLS, PROTOCOL_VERSION };
+export { handleRpc, callTool, TOOLS, HANDOFF_TOOLS, PROTOCOL_VERSION };
