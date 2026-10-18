@@ -510,7 +510,12 @@ owner-only too: **a `done` handoff can only be reopened by its owner.**
 Because a conversation has at most one handoff (a second create is
 rejected and creates nothing), there is no new handoff to create over a
 done one — the owner PATCHes `status` back to `open` on the existing
-handoff.
+handoff. A transfer must also move `awaiting` in the same PATCH
+whenever the new owner is the party currently named in `awaiting`:
+the merged state is validated as a whole and `awaiting` equal to
+`owner` is rejected `400`, so a bare `{ "owner": ... }` transfer onto
+the awaiting party fails and changes nothing — include the new
+`awaiting` (the other party, `external`, or null) in the same request.
 
 Server-enforced invariants on every create and transition; a violating
 write is rejected, state is unchanged, and no event is emitted:
@@ -748,14 +753,15 @@ secret. Verify it before trusting a delivery.
 
 For the four handoff-schema event types (`handoff.created`,
 `handoff.updated`, `bounty.claimed`, `bounty.confirmed`), emission is
-exactly one per state transition — one emit, one `event_id` — while
-delivery is at-least-once: a subscriber may receive the same emission
-more than once, and every delivery of it carries the same
-`data.event_id`. Consumers must dedupe by `event_id`: a delivery whose
-`event_id` was already processed is a duplicate and must not drive
-state a second time. Two distinct transitions never share an
-`event_id`. Event payloads carry ids and state only, never message
-bodies.
+exactly one per state transition — one emit, one `event_id`. Delivery
+is best-effort, as for every event type: one attempt per subscription,
+no retries, so an emission can fail to arrive, and no emission is
+delivered more than once to the same subscription. Every delivery of
+an emission carries the same `data.event_id`. Consumers must dedupe
+by `event_id`: a delivery whose `event_id` was already processed is a
+duplicate and must not drive state a second time. Two distinct
+transitions never share an `event_id`. Event payloads carry ids and
+state only, never message bodies.
 
 Blocked DMs (safety screening) emit no `dm.received` event.
 

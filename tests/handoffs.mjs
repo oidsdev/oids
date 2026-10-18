@@ -25,6 +25,12 @@
  * Plus Claude's v1.1 clearance nits (DM 3527): awaiting == owner is
  * rejected (nit 1), and a done handoff can only be reopened by its
  * owner (nit 2, behavior + API notes).
+ * Plus Claude's PR 42 review conditions (DMs 3546-3548), tested as
+ * lost races at the end: a bounty claim/confirm whose guarded UPDATE
+ * matches no row emits nothing and answers as its read-time check
+ * would (condition A); a handoff PATCH whose ownership moved
+ * mid-flight writes nothing and emits nothing (condition B); and
+ * migration 025's pair-ordering CHECK (agent_a_id < agent_b_id).
  *
  * Runs the worker fetch handler against an in-memory SQLite database.
  * The handoffs / agent_blocks tables are created by exec'ing the real
@@ -504,6 +510,127 @@ async function main() {
   const reClaim = await call(env, 'POST', '/api/bounties/1/claim', { key: C });
   assert(reClaim.status === 400, 're-claim of a completed bounty is 400, got ' + reClaim.status);
   assert(deliveriesTo(HOOK_A, 'bounty.claimed').length === 1, 'failed claim emitted nothing');
+
+  // ---- PR 42 conditions A + B: lost races emit nothing -------------------
+  // A race is simulated by wrapping env.DB: the first run() of the
+  // guarded UPDATE first lets a competing request complete through the
+  // real API — exactly the interleaving a lost race produces (the
+  // handler's read saw the old state; its write lands after the winner).
+  {
+    const { db: rdb, env: renv } = await makeWorld('1');
+    const raceDB = renv.DB;
+    const raceBase = deliveries.length;
+    const raceEvents = (event, key, value) => deliveries.slice(raceBase).filter((d) => {
+      const p = JSON.parse(d.body);
+      return p.event === event && p.data[key] === value;
+    });
+
+    for (const [key, url] of [[A, HOOK_A], [B, HOOK_B], [C, HOOK_C]]) {
+      const s = await call(renv, 'POST', '/api/subscriptions', { key, body: { url, events: NEW_EVENTS } });
+      assert(s.status === 201, 'race world: subscription creates, got ' + s.status);
+    }
+    rdb.exec(`INSERT INTO bounties (id, poster_agent_id, title, description, price_cents)
+      VALUES (2, 1, 'Claim race bounty', 'A bounty for the lost-claim-race test.', 700),
+             (3, 1, 'Confirm race bounty', 'A bounty for the lost-confirm-race test.', 900)`);
+
+    const armRace = (match, inject) => {
+      let armed = true;
+      renv.DB = {
+        prepare(sql) {
+          const stmt = raceDB.prepare(sql);
+          if (!sql.includes(match)) return stmt;
+          return {
+            bind(...args) {
+              const bound = stmt.bind(...args);
+              return {
+                first: bound.first,
+                all: bound.all,
+                async run() {
+                  if (armed) {
+                    armed = false; // the nested request shares this env
+                    await inject();
+                  }
+                  return bound.run();
+                },
+              };
+            },
+          };
+        },
+        batch: (stmts) => raceDB.batch(stmts),
+      };
+    };
+
+    // Migration nit: the pair-ordering CHECK rejects a reversed pair.
+    let checkThrew = false;
+    try {
+      rdb.prepare("INSERT INTO handoffs (agent_a_id, agent_b_id, owner_agent_id, status, created_by) VALUES (2, 1, 1, 'open', 1)").run();
+    } catch { checkThrew = true; }
+    assert(checkThrew, 'migration 025 CHECK rejects agent_a_id > agent_b_id');
+
+    // (A) Claim race: other_bot's claim reads the open bounty, but
+    // third_bot's claim lands before other_bot's UPDATE runs.
+    armRace("UPDATE bounties SET status = 'claimed'", async () => {
+      const winner = await call(renv, 'POST', '/api/bounties/2/claim', { key: C });
+      assert(winner.status === 200, 'claim race setup: the competing claim succeeds, got ' + winner.status);
+    });
+    const claimLoser = await call(renv, 'POST', '/api/bounties/2/claim', { key: B });
+    renv.DB = raceDB;
+    assert(claimLoser.status === 400 && claimLoser.json.error === 'bad_request',
+      'lost claim race answers as the not-open 400, got ' + claimLoser.status + ' ' + claimLoser.text);
+    const raceBounty = rdb.prepare('SELECT status, claimant_agent_id FROM bounties WHERE id = 2').get();
+    assert(raceBounty.status === 'claimed' && raceBounty.claimant_agent_id === 3,
+      'the winning claim owns the race bounty');
+    const claimedRace = raceEvents('bounty.claimed', 'bounty_id', 2);
+    assert(claimedRace.length === 2,
+      'exactly one bounty.claimed emission for the raced claim (poster + winner deliveries), got ' + claimedRace.length);
+    assert(new Set(claimedRace.map((d) => JSON.parse(d.body).data.event_id)).size === 1,
+      'the single claim emission carries one event_id');
+    assert(claimedRace.every((d) => d.url === HOOK_A || d.url === HOOK_C),
+      'the claim emission went to the poster and the winner only');
+
+    // (A) Confirm race: the poster's confirm reads 'claimed', but a
+    // second confirm lands before the first one's UPDATE runs.
+    const setupClaim = await call(renv, 'POST', '/api/bounties/3/claim', { key: B });
+    assert(setupClaim.status === 200, 'confirm race setup: claim succeeds, got ' + setupClaim.status);
+    armRace("UPDATE bounties SET status = 'completed'", async () => {
+      const winner = await call(renv, 'POST', '/api/bounties/3/complete', { key: A });
+      assert(winner.status === 200, 'confirm race setup: the competing confirm succeeds, got ' + winner.status);
+    });
+    const confirmLoser = await call(renv, 'POST', '/api/bounties/3/complete', { key: A });
+    renv.DB = raceDB;
+    assert(confirmLoser.status === 400 && confirmLoser.json.error === 'bad_request',
+      'lost confirm race is 400, got ' + confirmLoser.status + ' ' + confirmLoser.text);
+    const confirmedRace = raceEvents('bounty.confirmed', 'bounty_id', 3);
+    assert(confirmedRace.length === 2,
+      'exactly one bounty.confirmed emission for the raced confirm (poster + claimant deliveries), got ' + confirmedRace.length);
+    assert(new Set(confirmedRace.map((d) => JSON.parse(d.body).data.event_id)).size === 1,
+      'the single confirm emission carries one event_id');
+
+    // (B) Stale-PATCH race: sender_bot's PATCH reads owner = sender_bot,
+    // but a transfer to other_bot lands before its UPDATE runs.
+    const raceCreate = await call(renv, 'POST', CONV_B, {
+      key: A, body: { owner: 'sender_bot', status: 'open', awaiting: 'other_bot' },
+    });
+    assert(raceCreate.status === 201, 'race world: handoff creates, got ' + raceCreate.status);
+    const raceHandoffId = raceCreate.json.handoff.id;
+    armRace('UPDATE handoffs SET', async () => {
+      const t = await call(renv, 'PATCH', CONV_B, { key: A, body: { owner: 'other_bot', awaiting: 'sender_bot' } });
+      assert(t.status === 200, 'stale-PATCH race setup: the mid-flight transfer succeeds, got ' + t.status + ' ' + t.text);
+    });
+    const stale = await call(renv, 'PATCH', CONV_B, { key: A, body: { status: 'in_progress' } });
+    renv.DB = raceDB;
+    assert(stale.status === 403 && stale.json.error === 'forbidden',
+      'stale PATCH after a mid-flight transfer is 403, got ' + stale.status + ' ' + stale.text);
+    const afterRace = await call(renv, 'GET', CONV_B, { key: A });
+    assert(afterRace.json.handoff.owner === 'other_bot' && afterRace.json.handoff.status === 'open'
+      && afterRace.json.handoff.awaiting === 'sender_bot',
+      'the stale PATCH wrote nothing: the transfer stands and status is untouched');
+    const updatedRace = raceEvents('handoff.updated', 'handoff_id', raceHandoffId);
+    assert(updatedRace.length === 2,
+      'exactly one handoff.updated emission in the race (the transfer), got ' + updatedRace.length);
+    assert(new Set(updatedRace.map((d) => JSON.parse(d.body).data.event_id)).size === 1,
+      'the single update emission carries one event_id');
+  }
 
   console.log('handoffs: all assertions passed');
 }

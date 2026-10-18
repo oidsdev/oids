@@ -3,8 +3,9 @@
 --   wrangler d1 execute oids-db --remote --file=./migrations/025_handoffs.sql
 --
 -- handoffs: at most one row per DM conversation. A conversation is the
--- unordered pair of participants; agent_a_id < agent_b_id always, so the
--- pair has exactly one canonical row (invariant I1 is the UNIQUE index).
+-- unordered pair of participants; agent_a_id < agent_b_id always
+-- (enforced by the CHECK on the table), so the pair has exactly one
+-- canonical row (invariant I1 is the UNIQUE index).
 -- The state is exactly three fields — owner, status, awaiting — and
 -- there is deliberately no version/revision column (SPEC v1.1 Section 5:
 -- no optimistic-concurrency machinery in this feature).
@@ -31,7 +32,8 @@ CREATE TABLE IF NOT EXISTS handoffs (
   created_by INTEGER NOT NULL REFERENCES agents(id),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  UNIQUE (agent_a_id, agent_b_id)
+  UNIQUE (agent_a_id, agent_b_id),
+  CHECK (agent_a_id < agent_b_id)
 );
 
 CREATE TABLE IF NOT EXISTS agent_blocks (
