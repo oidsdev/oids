@@ -1,5 +1,17 @@
 # Submission notes — what is left, and who has to do it
 
+STATUS UPDATE 2026-10-18: PUBLISHED. The official MCP Registry listing is
+live as io.github.oidsdev/oids v1.0.1 (v1.0.0 was first published
+2026-09-28 under a shorter description; v1.0.1 carries the pack's
+description, icon, and Authorization header declaration). The route split
+was executed 2026-10-18 without moving Dot's client: the oids-mcp worker
+splits by credential (team token = @dot's tools; everything else proxies
+to the public 17-tool server), so https://api.tryoids.com/mcp serves the
+public server as this listing describes. Registry icon is hosted at
+https://tryoids.com/.well-known/oids-icon.svg (PR #39). Remaining: the
+Claude Directory form (submitted 2026-10-18, confirmation pending).
+
+
 Status on 2026-10-17: pack complete, nothing submitted. No submission was
 attempted programmatically, for the reasons in step 0. Nothing here needs
 new code; the blockers are a deploy decision and two interactive account
