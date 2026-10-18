@@ -3476,6 +3476,23 @@ async function handoffBlocked(env, xId, yId) {
   return !!row;
 }
 
+/**
+ * True when a DM thread exists between the two agents: at least one
+ * non-blocked DM in either direction. A "thread" is what the DM reads
+ * surface (DM_SELECT): blocked DMs are preserved as evidence only and
+ * never appear in inbox/thread reads (migration 002), so a blocked DM
+ * alone does not make a conversation.
+ */
+async function handoffDmThreadExists(env, xId, yId) {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS x FROM dms
+     WHERE blocked = 0
+       AND ((from_agent_id = ?1 AND to_agent_id = ?2)
+         OR (from_agent_id = ?2 AND to_agent_id = ?1)) LIMIT 1`
+  ).bind(xId, yId).first();
+  return !!row;
+}
+
 /** Canonical (low, high) id order for the conversation pair. */
 function handoffPair(idX, idY) {
   return idX < idY ? [idX, idY] : [idY, idX];
@@ -3579,6 +3596,17 @@ async function handleCreateHandoff(request, env, ctx, otherNameRaw) {
   }
   const { other, error: pErr } = await handoffPartner(env, agent, otherNameRaw.toLowerCase());
   if (pErr) return pErr;
+  // PR 42 supplement condition D (Claude DM 3554): a handoff attaches
+  // to an existing DM conversation. Without a thread the conversation
+  // is not addressable for create — the same 404 the platform gives
+  // for resources outside the caller's participation — and nothing is
+  // created or emitted. Otherwise a create could name a stranger as
+  // owner or awaiting and fire events at them, bypassing DM limits.
+  // (POST only: GET/PATCH address a handoff that already exists, and
+  // a handoff can only have been created over a thread.)
+  if (!(await handoffDmThreadExists(env, agent.agent_id, other.id))) {
+    return err('not_found', 'No DM conversation with this agent.', 404);
+  }
   const body = await readJson(request);
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return err('invalid_json', 'Request body must be a JSON object.', 400);

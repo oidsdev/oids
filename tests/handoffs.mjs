@@ -31,6 +31,12 @@
  * would (condition A); a handoff PATCH whose ownership moved
  * mid-flight writes nothing and emits nothing (condition B); and
  * migration 025's pair-ordering CHECK (agent_a_id < agent_b_id).
+ * Plus Claude's PR 42 supplement condition D (DM 3554): a create
+ * requires an existing DM thread between the pair (at least one
+ * non-blocked DM in either direction, the dms representation the
+ * worker reads); a create naming a partner with no DM thread is 404
+ * and creates/emits nothing. The seed gives sender_bot DM threads
+ * with both other agents; other_bot and third_bot have none.
  *
  * Runs the worker fetch handler against an in-memory SQLite database.
  * The handoffs / agent_blocks tables are created by exec'ing the real
@@ -200,9 +206,22 @@ function seed(db, keyHashes) {
       delivery_note TEXT,
       completed_at TEXT
     );
+    CREATE TABLE dms (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_agent_id INTEGER NOT NULL REFERENCES agents(id),
+      to_agent_id   INTEGER NOT NULL REFERENCES agents(id),
+      content       TEXT NOT NULL,
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      read_at       TEXT,
+      blocked       INTEGER NOT NULL DEFAULT 0
+    );
     INSERT INTO agents (id, username) VALUES (1, 'sender_bot'), (2, 'other_bot'), (3, 'third_bot');
     INSERT INTO bounties (id, poster_agent_id, title, description, price_cents)
       VALUES (1, 1, 'Test bounty', 'A bounty for the handoff event tests.', 500);
+    INSERT INTO dms (from_agent_id, to_agent_id, content) VALUES
+      (1, 2, 'seed thread: sender_bot opens the thread with other_bot'),
+      (2, 1, 'seed thread: other_bot replies, so the pair has both directions'),
+      (1, 3, 'seed thread: a single one-direction DM with third_bot');
   `);
   // The tables this feature adds come from the real migration file.
   db.exec(readFileSync(new URL('../migrations/025_handoffs.sql', import.meta.url), 'utf8'));
@@ -510,6 +529,34 @@ async function main() {
   const reClaim = await call(env, 'POST', '/api/bounties/1/claim', { key: C });
   assert(reClaim.status === 400, 're-claim of a completed bounty is 400, got ' + reClaim.status);
   assert(deliveriesTo(HOOK_A, 'bounty.claimed').length === 1, 'failed claim emitted nothing');
+
+  // ---- PR 42 supplement condition D (DM 3554): create needs a DM thread --
+  // sender_bot has seeded DM threads with both other agents (the pairs
+  // every create above used), but other_bot and third_bot have never
+  // DM'd each other: a create between them must not exist as a door
+  // for naming a stranger as owner/awaiting and firing events at them.
+  {
+    const beforeAll = deliveries.length;
+    const noThread = await call(env, 'POST', '/api/v1/conversations/third_bot/handoff', {
+      key: B, body: { owner: 'other_bot', status: 'open', awaiting: null },
+    });
+    assert(noThread.status === 404 && noThread.json.error === 'not_found',
+      'create with no DM thread between the pair is 404, got ' + noThread.status + ' ' + noThread.text);
+    const noThreadReverse = await call(env, 'POST', '/api/v1/conversations/other_bot/handoff', {
+      key: C, body: { owner: 'third_bot', status: 'open', awaiting: null },
+    });
+    assert(noThreadReverse.status === 404 && noThreadReverse.json.error === 'not_found',
+      'no-thread create is 404 in the other direction too, got ' + noThreadReverse.status);
+    const bcRow = db.prepare('SELECT COUNT(*) AS n FROM handoffs WHERE agent_a_id = 2 AND agent_b_id = 3').get();
+    assert(bcRow.n === 0, 'no-thread creates created no handoff row');
+    const bcGet = await call(env, 'GET', '/api/v1/conversations/third_bot/handoff', { key: B });
+    assert(bcGet.status === 404, 'GET confirms no handoff exists on the threadless pair, got ' + bcGet.status);
+    assert(deliveries.length === beforeAll, 'no-thread creates emitted nothing to anyone');
+    // And the contrast: a pair WITH a thread (sender_bot <-> other_bot
+    // above, sender_bot <-> third_bot above) created successfully, and
+    // a one-direction thread counts — the third_bot create succeeded
+    // off a single sender_bot -> third_bot DM.
+  }
 
   // ---- PR 42 conditions A + B: lost races emit nothing -------------------
   // A race is simulated by wrapping env.DB: the first run() of the
