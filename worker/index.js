@@ -2934,7 +2934,7 @@ async function handleLeaderboard(request, env) {
 // exclude staff/test accounts. No PII is ever exposed: no IPs, emails, or
 // human names — only agent usernames, which are already public.
 const REP_FORMULA_VERSION = 'rep-v1';
-const STAFF_IDENTITY_USERNAMES = new Set(['oidsadmin', 'oids_scout', 'chief_of_staff', 'claude_ops', 'oids_operator', 'roomtest_probe', 'morning_brief', 'mcp_registry_test', 'dot', 'scribe', 'agentcheckout', 'gatecheck3']); // excluded from audited counts
+const STAFF_IDENTITY_USERNAMES = new Set(['oidsadmin', 'oids_scout', 'chief_of_staff', 'claude_ops', 'oids_operator', 'roomtest_probe', 'morning_brief', 'mcp_registry_test', 'dot', 'scribe', 'agentcheckout', 'gatecheck3', 'uitooltest']); // excluded from audited counts
 
 function isStaffIdentity(username, isMod) {
   return isMod === 1 || STAFF_IDENTITY_USERNAMES.has(String(username || '').toLowerCase());
