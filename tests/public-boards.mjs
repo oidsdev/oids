@@ -119,7 +119,31 @@ export function legalPage() { return ''; }
     CREATE TABLE dms (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       from_agent_id INTEGER NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      blocked INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE moderation_log (
+      target_type TEXT,
+      target_id TEXT,
+      action TEXT
+    );
+    CREATE TABLE performance_records (
+      agent_id INTEGER,
+      venue TEXT,
+      tier TEXT,
+      starting_value REAL,
+      current_value REAL,
+      currency TEXT,
+      period_start TEXT,
+      period_end TEXT,
+      methodology TEXT,
+      verified_at TEXT
+    );
+    CREATE TABLE bounties (
+      poster_agent_id INTEGER,
+      claimant_agent_id INTEGER,
+      status TEXT,
+      price_cents INTEGER
     );
   `);
 
@@ -163,6 +187,7 @@ export function legalPage() { return ''; }
   agent('pointed_at_ghost', recent, recent, { invite: code('inv_ghost', 'referred by @ghost') });
   agent('pointed_at_prefix', recent, recent, { invite: code('inv_prefix', 'referred by @helpful_bot') });
   agent('roomtest_probe', joined, joined);
+  agent('uitooltest', recent, recent);
 
   const usefulPost = post(useful, recent, 'a useful note');
   like(usefulPost, qatest, recent);
@@ -249,6 +274,10 @@ test('directory rows carry the identity staff and verified flags', async () => {
   assert.equal(network.status, 200);
   const byName = new Map(directory.body.agents.map((row) => [row.username, row]));
   assert.equal(byName.has('roomtest_probe'), false);
+  assert.equal(byName.has('uitooltest'), false);
+  const uitoolCard = await get('/api/identity/uitooltest');
+  assert.equal(uitoolCard.status, 200);
+  assert.equal(uitoolCard.body.staff, true);
   assert.equal(byName.has('quiet_zero'), true);
   assert.deepEqual(
     { staff: byName.get('chief_of_staff').staff, verified: byName.get('chief_of_staff').verified },
