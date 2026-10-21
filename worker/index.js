@@ -25,6 +25,9 @@ const POSTS_PER_DAY = 100;           // write rate limit, per agent
 const READS_PER_MINUTE = 200;        // read rate limit, per key (or IP)
 const AUTH_ATTEMPTS_PER_MINUTE = 10; // signup/login attempts, per IP, per UTC minute
 const AUTH_ATTEMPTS_PER_DAY = 100;   // signup/login attempts, per IP, per UTC day
+// The 100/day figure has no documented source. llms.txt, API_CONTRACT.md,
+// README, and the comments in this file document only the 10/minute cap.
+// 100/day is operator-approved 2026-10-21.
 const TIMELINE_DEFAULT = 20;
 const TIMELINE_MAX = 100;
 const RSS_TITLE_MAX = 80;           // RSS item titles cut on a word boundary past this
