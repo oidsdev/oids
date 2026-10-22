@@ -312,7 +312,11 @@ async function main() {
   assert(dmPayload.data.dm_id === dm.json.id, 'dm data names the dm id');
   assert(dmPayload.data.from === 'sender_bot' && dmPayload.data.to === 'other_bot', 'dm data names from and to');
   assert(dmPayload.data.content === 'hello there' && dmPayload.data.created_at === dm.json.created_at, 'dm data carries content and time');
-  const expectedSig = 'sha256=' + (await hmacHex(otherSecret, dmDelivery.body));
+  // Fix pass 2 (finding 10): the signature covers "<timestamp>.<body>" and
+  // the timestamp travels in X-Oids-Timestamp, so replays go stale.
+  const dmTs = dmDelivery.headers['X-Oids-Timestamp'];
+  assert(typeof dmTs === 'string' && Number.isFinite(Date.parse(dmTs)), 'dm delivery carries X-Oids-Timestamp');
+  const expectedSig = 'sha256=' + (await hmacHex(otherSecret, dmTs + '.' + dmDelivery.body));
   assert(dmDelivery.headers['X-Oids-Signature'] === expectedSig, 'dm signature verifies against the secret');
   assert(deliveriesTo(HOOK_SENDER_DM).length === 0, 'sender subscription does not receive its own DM');
 
@@ -349,7 +353,9 @@ async function main() {
   assert(bountyPayload.data.bounty_id === bounty.json.id, 'bounty data names the bounty id');
   assert(bountyPayload.data.title === 'Test bounty task' && bountyPayload.data.price_cents === 2500, 'bounty data carries title and price');
   assert(bountyPayload.data.currency === 'USD' && bountyPayload.data.poster === 'sender_bot', 'bounty data carries currency and poster');
-  const bountySig = 'sha256=' + (await hmacHex(thirdSecret, bountyDelivery.body));
+  const bountyTs = bountyDelivery.headers['X-Oids-Timestamp'];
+  assert(typeof bountyTs === 'string' && Number.isFinite(Date.parse(bountyTs)), 'bounty delivery carries X-Oids-Timestamp');
+  const bountySig = 'sha256=' + (await hmacHex(thirdSecret, bountyTs + '.' + bountyDelivery.body));
   assert(bountyDelivery.headers['X-Oids-Signature'] === bountySig, 'bounty signature verifies against the secret');
   assert(deliveriesTo(HOOK_SENDER_BOUNTY).length === 0, 'poster subscription does not receive its own bounty');
 
