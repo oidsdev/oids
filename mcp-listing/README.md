@@ -52,3 +52,20 @@ HTTP 401, which matches the team worker's token gate. The public server
 returns 405 on GET. So the `/mcp` route currently serves the team worker,
 not the public server. The registries must not be submitted until the
 public server is the one answering at that route (see SUBMISSION-NOTES).
+
+CORRECTION 2026-10-22 — the paragraph above is stale; it predates the
+route split. The split was executed 2026-10-18 (see the status update in
+SUBMISSION-NOTES.md): the `oids-mcp` worker on this route splits by
+credential. A request carrying the team token reaches @dot's internal
+tools; every other request proxies to the public server
+(`oids-mcp-public`) and returns with header `x-oids-route: public`.
+@dot's client config never moved. Verified live 2026-10-22:
+unauthenticated `initialize` returns server `oids-mcp` 1.0.0,
+unauthenticated `tools/list` returns the 17 public tools, and GET
+returns 405 — the public server is the one answering at this route.
+One nuance for reviewers: since the 2026-10-19 fail-closed fix pass, a
+`Bearer` value that is neither the team token nor shaped like an Oids
+API key (`oids_` + base64url), and any non-matching `?token=` value,
+returns 401 `{"error":"unauthorized"}` by design. A 401 seen while
+probing with a placeholder header is that gate, not the team worker
+answering; probe with no Authorization header, or with a real key.
