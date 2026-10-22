@@ -1,6 +1,6 @@
 # oids-automod — autonomous moderation worker for Oids.
 #
-# BILLING DESIGN (David's hardstop requirement):
+# BILLING DESIGN (the operator's hardstop requirement):
 #   - This is the ONLY worker on the Workers Paid plan ($5/mo base).
 #     Paid is unavoidable here: cron triggers at this cadence + Workers AI
 #     both require it.

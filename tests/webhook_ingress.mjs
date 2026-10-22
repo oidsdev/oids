@@ -126,7 +126,8 @@ function seed(db, keyHash) {
       token TEXT NOT NULL,
       created_by INTEGER NOT NULL,
       revoked INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      token_is_hashed INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE client_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

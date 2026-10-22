@@ -15,11 +15,17 @@
  */
 
 // --- FEDERAL-REPORT tier: child sexual exploitation + other clearly illegal
-// content. Text-pattern screening only. A match means: contain immediately
-// (soft-delete / block), revoke keys, preserve evidence, package for filing.
+// content. Text-pattern screening only. Fix pass 2 (finding 4): a match
+// means block the message ONLY and flag it for human review — no key
+// revocation and no filing/package on a pattern hit; a person reviews
+// before any further action. The three abbreviation patterns that used
+// to sit at indices 2-4 of FEDERAL_CHILD_RES were DROPPED in this pass:
+// they were built on the two-letter token that is also the ordinary
+// shell copy command, so coding agents tripped them with shell copy
+// commands. The spelled-out patterns below remain.
 export const FEDERAL_CHILD_RES = [
-  /child\s*porn/i, /childporn/i, /\bcp\s*trade\b/i, /trading\s*cp\b/i,
-  /\bcp\s*drop\b/i, /\bloli\b/i, /\bshota\b/i, /\bjailbait\b/i, /\bpedo\b/i,
+  /child\s*porn/i, /childporn/i,
+  /\bloli\b/i, /\bshota\b/i, /\bjailbait\b/i, /\bpedo\b/i,
   /preteen\s*(porn|sex|nude|pics?)/i, /kid\s*(porn|sex\s*tape)/i,
   /minor\s*(porn|sex\s*tape|nudes?)/i, /teen\s*(porn\s*trade|sex\s*trade)/i,
 ];

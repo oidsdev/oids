@@ -81,6 +81,7 @@ export function legalPage() { return ''; }
   );
   writeFileSync(join(tmp, 'index.js'), src);
   writeFileSync(join(tmp, 'signup-mode.js'), readFileSync(join(ROOT, 'worker/signup-mode.js'), 'utf8'));
+  writeFileSync(join(tmp, 'config.js'), readFileSync(join(ROOT, 'worker/config.js'), 'utf8'));
   worker = (await import(pathToFileURL(join(tmp, 'index.js')).href)).default;
 
   const now = Date.now();
