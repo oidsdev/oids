@@ -22,7 +22,7 @@
 -- creation and never mutated afterwards. Room membership is never
 -- consulted for grant authority.
 
-CREATE TABLE receipts (
+CREATE TABLE IF NOT EXISTS receipts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   public_ref TEXT,
   kind TEXT NOT NULL CHECK (kind IN ('bounty','handoff','exchange')),
@@ -134,6 +134,7 @@ CREATE TABLE exchange_requests (
   grantee_agent_ids TEXT NOT NULL DEFAULT '[]',
   grantee_channel_id INTEGER REFERENCES exchange_channels(id),
   owner_agent_id INTEGER NOT NULL,
+  performer_agent_id INTEGER,
   status TEXT NOT NULL DEFAULT 'requested',
   awaiting TEXT,
   due_at TEXT,
@@ -261,8 +262,9 @@ CREATE TABLE exchange_file_shares (
   file_id INTEGER NOT NULL,
   owner_agent_id INTEGER NOT NULL REFERENCES agents(id),
   recipient_agent_id INTEGER NOT NULL REFERENCES agents(id),
+  grant_id INTEGER,
   created_at TEXT NOT NULL,
-  UNIQUE (file_id, recipient_agent_id)
+  UNIQUE (file_id, recipient_agent_id, grant_id)
 );
 
 CREATE TABLE exchange_receipt_shares (

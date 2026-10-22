@@ -1402,6 +1402,18 @@ async function handleRoomAddMember(request, env, roomId) {
   await env.DB.prepare(
     'INSERT INTO room_members (room_id, agent_id, joined_at) VALUES (?1, ?2, ?3)'
   ).bind(roomId, target.id, new Date().toISOString()).run();
+  // X5 (audit-row option): a room linked to an Exchange channel gets
+  // an Exchange audit row for membership changes made through the
+  // base room routes too, so the channel exit rule can see them.
+  if (exchangeEnabled(env)) {
+    try {
+      const linked = await env.DB.prepare('SELECT id FROM exchange_channels WHERE room_id = ?1').bind(roomId).first();
+      if (linked) {
+        await exchangeAudit(env, 'channel', linked.id, agent.agent_id, 'member_joined', null, 'member',
+          { channel_id: linked.id, agent_id: target.id, at: new Date().toISOString() });
+      }
+    } catch { /* the audit write never blocks the room write */ }
+  }
   await logClientEvent(request, env, agent.agent_id);
   return json({ room_id: roomId, member: target.username });
 }
@@ -5598,26 +5610,33 @@ async function namesForIds(env, ids) {
   return out;
 }
 
-/** D4 idempotency: keys bind actor + operation + target + payload. */
+/** D4 idempotency: keys bind actor + operation + target + payload.
+ *  D5 reserve-first: the key row is claimed against the unique index
+ *  BEFORE the work runs, so a concurrent replay loses the race; it
+ *  either reads back the recorded result (once the first call has
+ *  completed) or gets a conflict while the first call is in flight.
+ *  Non-2xx outcomes are never recorded: the reservation is released
+ *  so a corrected retry with the same key can proceed. */
 async function exchangeIdem(request, env, agent, operation, targetRef, body, recheck, fn) {
   const key = request.headers.get('Idempotency-Key') || '';
   if (!key || key.length > 128) {
     return err('idempotency_key_required', 'Every Exchange write requires an Idempotency-Key header (128 chars max).', 400);
   }
+  const target = targetRef || '';
   const payloadHash = await sha256hex(stableStringify(body || {}));
   const prior = await env.DB.prepare(
     `SELECT operation, target_ref, response_status, response_body, payload_hash FROM exchange_idempotency
      WHERE actor_agent_id = ?1 AND idempotency_key = ?2`
   ).bind(agent.agent_id, key).all();
   const priorRows = prior.results || [];
-  const existing = priorRows.find((r) => r.operation === operation && r.target_ref === (targetRef || ''));
+  const existing = priorRows.find((r) => r.operation === operation && r.target_ref === target);
   if (priorRows.length && !existing) {
     // The key is bound to actor + operation + target + payload: reuse
     // for a different operation or target is a conflict, never a
     // fresh execution and never another binding's response.
     return err('idempotency_conflict', 'This Idempotency-Key was already used with a different payload, operation, or target.', 400);
   }
-  if (existing) {
+  if (existing && existing.response_status !== 0) {
     if (existing.payload_hash !== payloadHash) {
       return err('idempotency_conflict', 'This Idempotency-Key was already used with a different payload, operation, or target.', 400);
     }
@@ -5626,17 +5645,45 @@ async function exchangeIdem(request, env, agent, operation, targetRef, body, rec
     if (recheck && !(await recheck())) return err('not_found', 'Not found.', 404);
     return json(JSON.parse(existing.response_body), existing.response_status);
   }
-  const res = await fn();
+  if (existing) {
+    // A row with status 0 is a live reservation held by a concurrent
+    // call carrying the same key: this call loses the race (D5).
+    return err('idempotency_conflict', 'This Idempotency-Key is already in use by a concurrent request.', 409);
+  }
+  try {
+    await env.DB.prepare(
+      `INSERT INTO exchange_idempotency (actor_agent_id, operation, target_ref, idempotency_key, payload_hash, response_status, response_body, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, 0, '', ?6)`
+    ).bind(agent.agent_id, operation, target, key, payloadHash, new Date().toISOString()).run();
+  } catch {
+    return err('idempotency_conflict', 'This Idempotency-Key is already in use by a concurrent request.', 409);
+  }
+  const release = async () => {
+    try {
+      await env.DB.prepare(
+        `DELETE FROM exchange_idempotency WHERE actor_agent_id = ?1 AND operation = ?2 AND target_ref = ?3 AND idempotency_key = ?4`
+      ).bind(agent.agent_id, operation, target, key).run();
+    } catch { /* releasing a reservation is best-effort */ }
+  };
+  let res;
+  try {
+    res = await fn();
+  } catch (e) {
+    await release();
+    throw e;
+  }
   if (res.status >= 200 && res.status < 300) {
     try {
       const text = await res.clone().text();
       await env.DB.prepare(
-        `INSERT INTO exchange_idempotency (actor_agent_id, operation, target_ref, idempotency_key, payload_hash, response_status, response_body, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
-      ).bind(agent.agent_id, operation, targetRef || '', key, payloadHash, res.status, text, new Date().toISOString()).run();
+        `UPDATE exchange_idempotency SET response_status = ?5, response_body = ?6
+         WHERE actor_agent_id = ?1 AND operation = ?2 AND target_ref = ?3 AND idempotency_key = ?4`
+      ).bind(agent.agent_id, operation, target, key, res.status, text).run();
       return new Response(text, { status: res.status, headers: res.headers });
-    } catch { /* a lost idempotency insert never fails the write */ }
+    } catch { /* a lost idempotency record never fails the write */ }
+    return res;
   }
+  await release();
   return res;
 }
 
@@ -5688,12 +5735,17 @@ async function handleExchangeHumanSession(request, env) {
   const fieldErr = exchangeFields(body, new Set(['username', 'password', 'operator_label']));
   if (fieldErr) return fieldErr;
   const username = String(body.username || '').toLowerCase();
+  // X2: one identical answer for every failure mode. The rate limit
+  // and the pilot gate run BEFORE the password is looked at, so this
+  // route cannot be used to tell a right password from a wrong one,
+  // or a pilot account from any other account.
+  const fail = () => err('invalid_credentials', 'Wrong username or password.', 401);
+  if (!(await checkLimit(env, `rl:human-session:${username}:${minuteStamp()}`, 30, 120))) return fail();
+  if (!exchangeAdmitted(env, { agent_id: 0, username })) return fail();
   const target = await env.DB.prepare('SELECT id, username, password_hash FROM agents WHERE username = ?1')
     .bind(username).first();
   const ok = target ? await verifyPassword(String(body.password || ''), target.password_hash) : false;
-  if (!target || !ok) return err('invalid_credentials', 'Wrong username or password.', 401);
-  const fakeAgent = { agent_id: target.id, username: target.username };
-  if (!exchangeAdmitted(env, fakeAgent)) return err('not_found', 'Not found.', 404);
+  if (!target || !ok) return fail();
   const token = 'oids_human_' + b64url(randomBytes(32));
   const now = new Date();
   const expires = new Date(now.getTime() + EXCHANGE_APPROVAL_TTL_MS).toISOString();
@@ -5747,6 +5799,14 @@ async function exchangeSweep(env, ctx) {
   await env.DB.prepare(
     `UPDATE exchange_approvals SET status = 'expired' WHERE status = 'pending' AND approval_expires_at <= ?1`
   ).bind(now).run();
+  // Retention (Doors gate condition): door audit rows name the agent
+  // who entered; strip the actor id 90 days after the row was
+  // written. The row itself stays as the record of what happened.
+  const stripCutoff = new Date(Date.now() - 90 * 86400000).toISOString();
+  await env.DB.prepare(
+    `UPDATE exchange_audit SET actor_agent_id = NULL
+     WHERE actor_agent_id IS NOT NULL AND action LIKE 'door_%' AND created_at < ?1`
+  ).bind(stripCutoff).run();
 }
 
 /** Exchange rollup: settled when every leg is terminal (spec 5.4). */
@@ -5787,34 +5847,54 @@ async function listingAudienceAdmits(env, l, agentId) {
   return false;
 }
 async function getListingByRef(env, ref) {
-  if (/^\d+$/.test(String(ref))) {
-    return env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(Number(ref)).first();
-  }
+  // Refs only (X6): an integer id is not an Exchange address and is
+  // rejected here, for parties and non-parties alike.
+  if (/^\d+$/.test(String(ref))) return null;
   return env.DB.prepare('SELECT * FROM exchange_listings WHERE public_ref = ?1').bind(String(ref)).first();
 }
 async function getRequestByRef(env, ref) {
-  if (/^\d+$/.test(String(ref))) {
-    return env.DB.prepare('SELECT * FROM exchange_requests WHERE id = ?1').bind(Number(ref)).first();
-  }
+  // Refs only (X6): an integer id is not an Exchange address and is
+  // rejected here, for parties and non-parties alike.
+  if (/^\d+$/.test(String(ref))) return null;
   return env.DB.prepare('SELECT * FROM exchange_requests WHERE public_ref = ?1').bind(String(ref)).first();
 }
 async function getGrantByRef(env, ref) {
-  if (/^\d+$/.test(String(ref))) {
-    return env.DB.prepare('SELECT * FROM exchange_grants WHERE id = ?1').bind(Number(ref)).first();
-  }
+  // Refs only (X6): an integer id is not an Exchange address and is
+  // rejected here, for parties and non-parties alike.
+  if (/^\d+$/.test(String(ref))) return null;
   return env.DB.prepare('SELECT * FROM exchange_grants WHERE public_ref = ?1').bind(String(ref)).first();
 }
 async function getChannelByRef(env, ref) {
-  if (/^\d+$/.test(String(ref))) {
-    return env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(Number(ref)).first();
-  }
+  // Refs only (X6): an integer id is not an Exchange address and is
+  // rejected here, for parties and non-parties alike.
+  if (/^\d+$/.test(String(ref))) return null;
   return env.DB.prepare('SELECT * FROM exchange_channels WHERE public_ref = ?1').bind(String(ref)).first();
 }
 async function getExchangeByRef(env, ref) {
-  if (/^\d+$/.test(String(ref))) {
-    return env.DB.prepare('SELECT * FROM exchange_exchanges WHERE id = ?1').bind(Number(ref)).first();
-  }
+  // Refs only (X6): an integer id is not an Exchange address and is
+  // rejected here, for parties and non-parties alike.
+  if (/^\d+$/.test(String(ref))) return null;
   return env.DB.prepare('SELECT * FROM exchange_exchanges WHERE public_ref = ?1').bind(String(ref)).first();
+}
+function auditDetailAgentId(row) {
+  try {
+    const d = JSON.parse((row && row.detail_json) || '{}');
+    return typeof d.agent_id === 'number' ? d.agent_id : null;
+  } catch { return null; }
+}
+/** X3: find a channel exit row for exactly this agent. detail_json is
+ *  parsed and the numeric agent_id field compared, never substring
+ *  matched, so agent 1 can never collide with agent 12 or 100. */
+async function channelExitRow(env, channelId, sinceIso, actorId) {
+  const rows = await env.DB.prepare(
+    `SELECT detail_json, created_at FROM exchange_audit
+     WHERE object_kind = 'channel' AND object_id = ?1
+       AND action IN ('member_left','member_removed') AND created_at >= ?2 ORDER BY id`
+  ).bind(channelId, sinceIso).all();
+  for (const r of rows.results || []) {
+    if (auditDetailAgentId(r) === actorId) return r;
+  }
+  return null;
 }
 async function channelMember(env, channel, agentId) {
   if (!channel || !agentId) return false;
@@ -5893,7 +5973,7 @@ async function grantView(env, g, viewer) {
     human_approved_by: g.human_approved_by,
     done_by: g.done_by_agent_id ? await exchangeAgentName(env, g.done_by_agent_id) : null,
     done_at: g.done_at || null,
-    result_file_id: g.result_file_id || null,
+    has_result_file: !!g.result_file_id,
     result_file_digest: g.result_file_digest || null,
     revoke_reason: g.revoke_reason || null,
     created_at: g.created_at, updated_at: g.updated_at,
@@ -6196,7 +6276,7 @@ async function channelView(env, ch, viewer) {
      WHERE i.channel_id = ?1 AND i.status = 'invited' ORDER BY a.username`
   ).bind(ch.id).all();
   return {
-    ref: ch.public_ref, room_id: ch.room_id,
+    ref: ch.public_ref,
     name: ch.name, purpose: ch.purpose,
     admin: await exchangeAgentName(env, ch.admin_agent_id),
     creator: await exchangeAgentName(env, ch.creator_agent_id),
@@ -6435,7 +6515,14 @@ async function handleExchangeCreateRequest(request, env, ctx) {
   const parsed = await exchangeJsonBody(request);
   if (parsed.error) return parsed.error;
   const body = parsed.body;
-  return exchangeIdem(request, env, agent, 'request.create', String(body.listing_ref || ''), body, null, async () => {
+  return exchangeIdem(request, env, agent, 'request.create', String(body.listing_ref || ''), body,
+    async () => {
+      // Replay re-authorization (D4): the stored response is served
+      // only while the listing still admits this requester.
+      const l = await getListingByRef(env, body.listing_ref);
+      return !!l && (await listingAudienceAdmits(env, l, agent.agent_id));
+    },
+    async () => {
     const fieldErr = exchangeFields(body, new Set(['listing_ref', 'scope', 'purpose', 'exchange_ref', 'leg_label', 'channel_ref',
       'grantee_type', 'grantee_usernames', 'grantee_channel_ref', 'due_at', 'expires_at']));
     if (fieldErr) return fieldErr;
@@ -6578,7 +6665,18 @@ async function handleExchangeApprove(request, env, ctx, ref) {
     maxUses = parseInt(body.max_uses, 10);
     if (!Number.isFinite(maxUses) || maxUses < 1) return err('bad_max_uses', 'max_uses must be a positive integer.', 400);
   }
-  const proposed = parseIdList(reqRow.grantee_agent_ids);
+  // X5/C17: the grantee snapshot is taken at APPROVAL time. For a
+  // channel grantee the set is the channel membership right now, not
+  // the membership when the request was filed: an agent who left
+  // before approval is out, and one who joined before approval is in.
+  let proposed = parseIdList(reqRow.grantee_agent_ids);
+  if (reqRow.grantee_type === 'channel' && reqRow.grantee_channel_id) {
+    const gch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(reqRow.grantee_channel_id).first();
+    if (gch) {
+      const members = await env.DB.prepare('SELECT agent_id FROM room_members WHERE room_id = ?1').bind(gch.room_id).all();
+      proposed = (members.results || []).map((m) => m.agent_id);
+    }
+  }
   let granteeIds = proposed;
   if (body.grantee_usernames !== undefined) {
     if (!Array.isArray(body.grantee_usernames) || !body.grantee_usernames.length) {
@@ -6786,10 +6884,13 @@ async function handleExchangeGrant(request, env, ctx, ref) {
       }
       const grantId = grantIns.meta.last_row_id;
       await env.DB.prepare(`UPDATE exchange_approvals SET consumed_grant_id = ?1 WHERE id = ?2`).bind(grantId, approval.id).run();
-      const performerOwnerId = performer === 'owner' ? agent.agent_id : reqRow.requester_agent_id;
+      // X4: the listing owner stays the request owner for the life of
+      // the request. The performer principal is recorded in its own
+      // column instead of overwriting owner_agent_id.
+      const performerAgentId = performer === 'owner' ? agent.agent_id : reqRow.requester_agent_id;
       await env.DB.prepare(
-        `UPDATE exchange_requests SET status = 'active', owner_agent_id = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'requested'`
-      ).bind(performerOwnerId, now, reqRow.id).run();
+        `UPDATE exchange_requests SET status = 'active', performer_agent_id = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'requested'`
+      ).bind(performerAgentId, now, reqRow.id).run();
       const grant = await env.DB.prepare('SELECT * FROM exchange_grants WHERE id = ?1').bind(grantId).first();
       await exchangeAudit(env, 'grant', grantId, agent.agent_id, 'granted', 'requested', 'active',
         { grant_id: grantId, request_id: reqRow.id, approval_id: approval.id, canonical_hash: approval.canonical_hash });
@@ -6894,10 +6995,7 @@ async function grantExitDenied(env, g, actorId) {
   if (!channelId) return null;
   const ch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(channelId).first();
   if (!ch) return null;
-  const exitRow = await env.DB.prepare(
-    `SELECT id FROM exchange_audit WHERE object_kind = 'channel' AND object_id = ?1
-     AND action IN ('member_left','member_removed') AND created_at >= ?2 AND detail_json LIKE ?3 LIMIT 1`
-  ).bind(ch.id, g.grantee_snapshot_at, `%"agent_id":${actorId}%`).first();
+  const exitRow = await channelExitRow(env, ch.id, g.grantee_snapshot_at, actorId);
   if (exitRow) return ch;
   if (g.grantee_type === 'channel' && !(await channelMember(env, ch, actorId))) return ch;
   return null;
@@ -6935,12 +7033,15 @@ async function exchangeCheckResultFile(env, g, actor, fileId) {
   const recipients = grantResultRecipients(g);
   const isUploader = file.agent_id === actor.agent_id;
   if (!isUploader) {
+    // X1: reading a file is not authority to attach it. A non-uploader
+    // may attach only when the uploader recorded a share for THIS
+    // grant; a share recorded for any other purpose does not count.
     for (const rid of recipients) {
       const share = await env.DB.prepare(
-        'SELECT id, owner_agent_id FROM exchange_file_shares WHERE file_id = ?1 AND recipient_agent_id = ?2'
-      ).bind(fileId, rid).first();
+        'SELECT id, owner_agent_id FROM exchange_file_shares WHERE file_id = ?1 AND recipient_agent_id = ?2 AND grant_id = ?3'
+      ).bind(fileId, rid, g.id).first();
       if (!share || share.owner_agent_id !== file.agent_id) {
-        return { error: err('forbidden', 'You may read that file, but reading is not authority to share it. The uploader must record a share for the approved recipients first.', 403) };
+        return { error: err('forbidden', 'You may read that file, but reading is not authority to share it. The uploader must record a share for this grant and its approved recipients first.', 403) };
       }
     }
   }
@@ -7209,7 +7310,16 @@ async function handleExchangeGetGrant(request, env, ref) {
   if (error) return error;
   const g = await getGrantByRef(env, ref);
   if (!g) return err('not_found', 'No such grant.', 404);
-  if (isGrantParty(g, agent.agent_id)) return json({ grant: await grantView(env, g, agent) });
+  if (isGrantParty(g, agent.agent_id)) {
+    // X5: a grantee who exited the linked channel loses the full
+    // grant view as well as act authority; what remains is the
+    // state-only projection any channel observer gets.
+    const isPrincipal = g.owner_agent_id === agent.agent_id || g.requester_agent_id === agent.agent_id;
+    if (isPrincipal || !(await grantExitDenied(env, g, agent.agent_id))) {
+      return json({ grant: await grantView(env, g, agent) });
+    }
+    return json({ grant: grantStateView(g), projection: 'state_only' });
+  }
   if (/^\d+$/.test(String(ref))) return err('not_found', 'No such grant.', 404);
   const reqRow = await env.DB.prepare('SELECT exchange_id, channel_id FROM exchange_requests WHERE id = ?1').bind(g.request_id).first();
   if (reqRow && reqRow.exchange_id) {
@@ -7242,9 +7352,18 @@ async function handleExchangeGrantResult(request, env, ref) {
     return err('not_found', 'No result file on this grant.', 404);
   }
   if (g.status !== 'done' && g.status !== 'confirmed') return err('not_found', 'No result file on this grant.', 404);
+  // X8: this handler checks grant expiry itself; it never relies on
+  // the lazy sweep having run first.
+  if (Date.parse(g.expires_at) <= Date.now()) return err('not_found', 'No result file on this grant.', 404);
   if (!env.FILES) return err('storage_unavailable', 'File storage is not configured yet.', 503);
   const file = await env.DB.prepare('SELECT * FROM files WHERE id = ?1').bind(g.result_file_id).first();
   if (!file) return err('not_found', 'Result file is gone.', 404);
+  // X1: an agent whose only claim is having declared completion
+  // reads the result only when they uploaded the file themselves.
+  if (g.done_by_agent_id === agent.agent_id && g.owner_agent_id !== agent.agent_id
+    && !recipients.includes(agent.agent_id) && file.agent_id !== agent.agent_id) {
+    return err('not_found', 'No result file on this grant.', 404);
+  }
   let bytes;
   try {
     const obj = await env.FILES.get(file.r2_key);
@@ -7411,10 +7530,16 @@ async function handleExchangeAuditRead(request, env, kind, ref) {
     isParty = await channelMember(env, obj, agent.agent_id);
     if (!isParty) {
       // A party who exited keeps the trail up to their exit (D2).
-      const exitRow = await env.DB.prepare(
-        `SELECT created_at FROM exchange_audit WHERE object_kind = 'channel' AND object_id = ?1
-         AND action IN ('member_left','member_removed') AND detail_json LIKE ?2 ORDER BY id DESC LIMIT 1`
-      ).bind(obj.id, `%"agent_id":${agent.agent_id}%`).first();
+      // X3: exact numeric match on the parsed detail, never a
+      // substring match (agent 1 must not inherit agent 12's exit).
+      const exitRows = await env.DB.prepare(
+        `SELECT detail_json, created_at FROM exchange_audit WHERE object_kind = 'channel' AND object_id = ?1
+         AND action IN ('member_left','member_removed') ORDER BY id DESC`
+      ).bind(obj.id).all();
+      let exitRow = null;
+      for (const r of exitRows.results || []) {
+        if (auditDetailAgentId(r) === agent.agent_id) { exitRow = r; break; }
+      }
       if (exitRow) { isParty = true; exitCutoff = exitRow.created_at; }
     }
   }
@@ -7477,6 +7602,8 @@ async function handleExchangeReceiptShareConsent(request, env, ctx, receiptRef) 
   }
   const ch = await getChannelByRef(env, body.channel_ref || '');
   if (!ch) return err('not_found', 'No such channel.', 404);
+  // X6: the channel ref is returned only to a channel member.
+  if (!(await channelMember(env, ch, agent.agent_id))) return err('not_found', 'No such channel.', 404);
   const now = new Date().toISOString();
   await env.DB.prepare(
     `INSERT OR IGNORE INTO exchange_receipt_shares (receipt_id, channel_id, consented_by_agent_id, created_at) VALUES (?1, ?2, ?3, ?4)`
@@ -7536,6 +7663,11 @@ async function handleExchangeReport(request, env, ctx) {
   if (fieldErr) return fieldErr;
   const listing = await getListingByRef(env, body.listing_ref || '');
   if (!listing) return err('not_found', 'No such listing.', 404);
+  // X6: a draft listing is not public; reporting one must not hand
+  // its ref back to a reporter who cannot otherwise see it.
+  if (listing.status === 'draft' && listing.owner_agent_id !== agent.agent_id) {
+    return err('not_found', 'No such listing.', 404);
+  }
   const reason = sanitizeContent(body.reason || '');
   if (!reason) return err('bad_request', 'reason is required.', 400);
   if (scanCredentialText(reason)) return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
@@ -7545,7 +7677,7 @@ async function handleExchangeReport(request, env, ctx) {
   ).bind(listing.id, agent.agent_id, reason, now).run();
   await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'reported', listing.status, listing.status, { listing_id: listing.id, report_id: ins.meta.last_row_id });
   return json({
-    report_id: ins.meta.last_row_id, listing_ref: listing.public_ref,
+    listing_ref: listing.public_ref,
     takedown_contact: EXCHANGE_TAKEDOWN_CONTACT,
     note: 'Reports go to the staffed takedown contact. On credible notice a listing is suspended within 24 hours, ahead of full review, and the owner is told why.',
   }, 201);
@@ -7702,7 +7834,10 @@ matters.</p>`;
 
 async function handleExchangeRoute(request, env, ctx, path, method) {
   if (!exchangeEnabled(env)) return err('not_found', 'Not found.', 404);
-  await exchangeSweep(env, ctx);
+  // The sweep is lazy bookkeeping; every handler also checks
+  // authoritative time itself. EXCHANGE_SWEEP_DISABLED=1 is an
+  // internal test/diagnostic switch that proves exactly that.
+  if (!env || env.EXCHANGE_SWEEP_DISABLED !== '1') await exchangeSweep(env, ctx);
   const seg = path.split('/').filter(Boolean); // api, v1, exchange, ...
   const sub = seg.slice(3);
   if (method === 'POST' && sub.length === 1 && sub[0] === 'human-session') return handleExchangeHumanSession(request, env);
@@ -7768,20 +7903,30 @@ async function handleExchangeRoute(request, env, ctx, path, method) {
     if (file.agent_id !== pre.agent.agent_id) return err('forbidden', 'Only the uploader can record share authority for a file.', 403);
     const parsed = await exchangeJsonBody(request);
     if (parsed.error) return parsed.error;
-    const fieldErr = exchangeFields(parsed.body, new Set(['recipient_usernames']));
+    const fieldErr = exchangeFields(parsed.body, new Set(['recipient_usernames', 'grant_ref']));
     if (fieldErr) return fieldErr;
     if (!Array.isArray(parsed.body.recipient_usernames)) return err('bad_request', 'recipient_usernames must be an array.', 400);
+    // X1: a share may be recorded for one specific grant (grant_ref);
+    // only a grant-scoped share can support attaching that file as
+    // the grant's result. A share with no grant_ref is a general
+    // share and supports no attachment.
+    let grantId = null;
+    if (parsed.body.grant_ref) {
+      const g = await getGrantByRef(env, parsed.body.grant_ref);
+      if (!g) return err('not_found', 'No such grant.', 404);
+      grantId = g.id;
+    }
     const now = new Date().toISOString();
     const shared = [];
     for (const n of parsed.body.recipient_usernames) {
       const a = await exchangeAgentByName(env, n);
       if (!a) return err('not_found', `No such agent: ${n}.`, 404);
       await env.DB.prepare(
-        `INSERT OR IGNORE INTO exchange_file_shares (file_id, owner_agent_id, recipient_agent_id, created_at) VALUES (?1, ?2, ?3, ?4)`
-      ).bind(fileId, pre.agent.agent_id, a.id, now).run();
+        `INSERT OR IGNORE INTO exchange_file_shares (file_id, owner_agent_id, recipient_agent_id, grant_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)`
+      ).bind(fileId, pre.agent.agent_id, a.id, grantId, now).run();
       shared.push(a.username);
     }
-    return json({ file_id: fileId, shared_with: shared });
+    return json({ shared_with: shared });
   }
   return err('not_found', 'Unknown Exchange endpoint.', 404);
 }
@@ -8240,13 +8385,21 @@ export default {
     if (path.startsWith('/api/v1/exchange/')) {
       return R(handleExchangeRoute(request, env, ctx, path, method));
     }
-    if (exchangeEnabled(env) && method === 'GET' && path === '/legal/exchange-terms.html') {
-      return R(new Response(legalPage('Capability Exchange Terms (Draft)', EXCHANGE_TERMS_DRAFT), {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', ...pageHeaders(), ...corsHeaders() },
-      }));
-    }
-    if (exchangeEnabled(env) && method === 'GET' && path === '/legal/exchange-takedown.html') {
-      return R(new Response(legalPage('Capability Exchange Takedown (Draft)', EXCHANGE_TAKEDOWN_DRAFT), {
+    if (method === 'GET' && (path === '/legal/exchange-terms.html' || path === '/legal/exchange-takedown.html')) {
+      // X9: while the pilot gate is on, the draft Exchange legal
+      // pages are served only to pilot-admitted agents; everyone
+      // else gets the same 404 as a page that does not exist. They
+      // become public only when the Exchange itself is public.
+      let serveLegal = exchangeEnabled(env) && exchangePublic(env);
+      if (!serveLegal && exchangeEnabled(env)) {
+        const legalAgent = await authAgent(request, env);
+        serveLegal = !!legalAgent && exchangeAdmitted(env, legalAgent);
+      }
+      if (!serveLegal) return R(err('not_found', 'Unknown endpoint. See /llms.txt.', 404));
+      const isTerms = path === '/legal/exchange-terms.html';
+      return R(new Response(legalPage(
+        isTerms ? 'Capability Exchange Terms (Draft)' : 'Capability Exchange Takedown (Draft)',
+        isTerms ? EXCHANGE_TERMS_DRAFT : EXCHANGE_TAKEDOWN_DRAFT), {
         headers: { 'Content-Type': 'text/html; charset=utf-8', ...pageHeaders(), ...corsHeaders() },
       }));
     }

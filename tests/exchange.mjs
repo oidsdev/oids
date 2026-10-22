@@ -160,6 +160,7 @@ async function makeWorld(opts = {}) {
   if (opts.public) env.EXCHANGE_PUBLIC = '1';
   env.EXCHANGE_PILOT_AGENTS = opts.pilot === undefined ? ALL_NAMES : opts.pilot;
   if (opts.handoffs) env.HANDOFFS_ENABLED = '1';
+  if (opts.sweepOff) env.EXCHANGE_SWEEP_DISABLED = '1';
   currentEnv = env;
   const call = async (method, path, { key, body, idem, human, headers: extra } = {}) => {
     const headers = { 'Content-Type': 'application/json', ...(extra || {}) };
@@ -461,7 +462,7 @@ async function acceptance() {
     const byInt = await w.call('GET', `/api/v1/exchange/listings/${row.id}`, { key: KEY.third_bot });
     assert(byInt.status === 404, 'integer id from a non-party answers as nonexistent');
     const byIntParty = await w.call('GET', `/api/v1/exchange/listings/${row.id}`, { key: KEY.borrower_bot });
-    assert(byIntParty.status === 200, 'integer id works on a party-checked surface');
+    assert(byIntParty.status === 404, 'integer id is rejected even for a party (X6: refs only), got ' + byIntParty.status);
     assert(/^[A-Za-z0-9_-]{22}$/.test(allow.ref), 'public_ref is a 128-bit base64url token');
   });
 
@@ -489,7 +490,17 @@ async function acceptance() {
     const anyAgent = await pub.call('GET', '/api/v1/exchange/listings', { key: KEY.borrower_bot });
     assert(anyAgent.status === 200, 'EXCHANGE_PUBLIC=1 is the explicit public enablement step');
     const terms = await pub.call('GET', '/legal/exchange-terms.html', {});
-    assert(terms.status === 200 && /DRAFT/.test(terms.text), 'draft terms page is served while the flag is on');
+    assert(terms.status === 200 && /DRAFT/.test(terms.text), 'draft terms page is public only once the Exchange itself is public');
+    // X9: while the pilot gate is on, the draft legal pages serve
+    // only to pilot-admitted agents; everyone else gets a 404.
+    const pilotTermsAnon = await pilot.call('GET', '/legal/exchange-terms.html', {});
+    assert(pilotTermsAnon.status === 404, 'pilot gate: anonymous legal-page read 404s, got ' + pilotTermsAnon.status);
+    const pilotTermsOutsider = await pilot.call('GET', '/legal/exchange-terms.html', { key: KEY.borrower_bot });
+    assert(pilotTermsOutsider.status === 404, 'pilot gate: a non-pilot agent gets a 404 on the draft legal pages');
+    const pilotTermsInsider = await pilot.call('GET', '/legal/exchange-terms.html', { key: KEY.owner_bot });
+    assert(pilotTermsInsider.status === 200 && /DRAFT/.test(pilotTermsInsider.text), 'pilot gate: a pilot agent is served the draft terms page');
+    const pilotTakedownInsider = await pilot.call('GET', '/legal/exchange-takedown.html', { key: KEY.owner_bot });
+    assert(pilotTakedownInsider.status === 200, 'pilot gate: a pilot agent is served the draft takedown page');
   });
 
   await section('T16 credential-shaped input (unknown field + C5 scanner)', async () => {
@@ -510,12 +521,13 @@ async function acceptance() {
   await section('T16b credential scan on channel-linked room messages (C5/Q3)', async () => {
     const w = await makeWorld();
     const ch = await channelSetup(w);
+    const roomId = sqlOne(w, 'SELECT room_id FROM exchange_channels WHERE public_ref = ?', ch.ref).room_id;
     await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.borrower_bot, body: {} });
-    const bad = await w.call('POST', `/api/rooms/${ch.room_id}/messages`, { key: KEY.borrower_bot, idem: false, body: { content: 'Here is the key: sk-roomsecret123456789 for the job.' } });
+    const bad = await w.call('POST', `/api/rooms/${roomId}/messages`, { key: KEY.borrower_bot, idem: false, body: { content: 'Here is the key: sk-roomsecret123456789 for the job.' } });
     assert(bad.status === 400 && bad.json.error === 'credential_blocked', 'credential-shaped room message is blocked, got ' + bad.status + ' ' + bad.text);
-    const msgs = await w.call('GET', `/api/rooms/${ch.room_id}/messages`, { key: KEY.owner_bot });
+    const msgs = await w.call('GET', `/api/rooms/${roomId}/messages`, { key: KEY.owner_bot });
     assert(!msgs.json.messages.some((m) => m.content.includes('sk-roomsecret')), 'the blocked message was not stored');
-    const good = await w.call('POST', `/api/rooms/${ch.room_id}/messages`, { key: KEY.borrower_bot, idem: false, body: { content: 'Clean coordination note for channel ' + ch.ref + '.' } });
+    const good = await w.call('POST', `/api/rooms/${roomId}/messages`, { key: KEY.borrower_bot, idem: false, body: { content: 'Clean coordination note for channel ' + ch.ref + '.' } });
     assert(good.status === 201, 'clean room messages still flow, got ' + good.status);
     const auditRow = sqlOne(w, "SELECT detail_json FROM exchange_audit WHERE object_kind = 'channel' AND action = 'credential_blocked'");
     assert(auditRow && !String(auditRow.detail_json).includes('sk-roomsecret'), 'room scan rejection is logged by pattern class only');
@@ -546,15 +558,24 @@ async function acceptance() {
     const asAnon = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, {});
     assert(asAnon.status === 401 || asAnon.status === 404, 'anonymous download fails');
     // No integer ids in Exchange responses (folded section 13 ruling):
-    // objects are addressed and returned by public_ref only.
-    const listingJson = JSON.stringify(listing);
-    assert(!/"id":\d/.test(listingJson), 'listing response carries no integer id');
-    const grantJson = JSON.stringify(done.json.grant);
-    assert(!/"id":\d/.test(grantJson), 'grant response carries no integer id');
+    // objects are addressed and returned by public_ref only. X8: the
+    // check is structural — any key that is "id" or ends in "_id"
+    // holding an integer, at any depth, fails it.
+    const hasIntId = (v) => {
+      if (Array.isArray(v)) return v.some(hasIntId);
+      if (v && typeof v === 'object') {
+        return Object.entries(v).some(([k, val]) => (k === 'id' || k.endsWith('_id')) && Number.isInteger(val) || hasIntId(val));
+      }
+      return false;
+    };
+    assert(!hasIntId(listing), 'listing response carries no integer id field');
+    assert(!hasIntId(done.json.grant), 'grant response carries no integer id field');
+    const reqView = await w.call('GET', `/api/v1/exchange/requests/${req.ref}`, { key: KEY.owner_bot });
+    assert(reqView.status === 200 && !hasIntId(reqView.json), 'request response carries no integer id field');
     const chView = await w.call('GET', `/api/v1/exchange/channels/${ch.ref}`, { key: KEY.owner_bot });
-    assert(!/"id":\d/.test(JSON.stringify(chView.json.channel)), 'channel response carries no integer id');
+    assert(!hasIntId(chView.json.channel), 'channel response carries no integer id field');
     const audit = await w.call('GET', `/api/v1/exchange/objects/grant/${grant.ref}/audit`, { key: KEY.owner_bot });
-    assert(audit.status === 200 && !/"id":\d/.test(JSON.stringify(audit.json)), 'audit response carries no integer ids, got ' + audit.status);
+    assert(audit.status === 200 && !hasIntId(audit.json), 'audit response carries no integer id fields, got ' + audit.status);
   });
 
   await section('DROP-1 receipts authorize nothing (legal drop list item 1)', async () => {
@@ -593,7 +614,8 @@ async function acceptance() {
   await section('T19/C16-C21 copy scan of shipped Exchange strings', async () => {
     const src = readFileSync(new URL('../worker/index.js', import.meta.url), 'utf8');
     const block = src.slice(src.indexOf('// ===== EXCHANGE BEGIN ====='), src.indexOf('// ===== EXCHANGE END ====='));
-    const bans = [/stopped/i, /\bverified\b/i, /independent/i, /trust score/i, /hard cap/i, /halted/i, /work has stopped/i, /we verified/i];
+    const bans = [/stopped/i, /\bverified\b/i, /independent/i, /trust score/i, /hard cap/i, /halted/i, /work has stopped/i, /we verified/i,
+      /spend ceiling/i, /unlocks/i, /qualifies for/i, /counts toward/i];
     for (const b of bans) assert(!b.test(block), 'exchange copy must not contain ' + b);
     assert(block.includes('confirmed by counterparty'), 'receipt wording is confirmed by counterparty');
     assert(block.includes('authorization') && block.includes('ended'), 'revoke/expiry copy says authorization ended');
@@ -764,6 +786,162 @@ async function channelsAndMultiParty() {
     assert(offCall === null, 'exchange tools are unknown while the MCP flag is off');
   });
 }
+
+
+// ===========================================================================
+// Gate round 2 (2026-10-22): X1-X9 delta coverage
+// ===========================================================================
+async function gateRound2() {
+  await section('X1 third-party share attack + declarer download rule', async () => {
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Design review' });
+    const req = await fileRequest(w, 'borrower_bot', listing.ref);
+    const { grant } = await approveAndGrant(w, 'owner_bot', listing.human, req.ref, { performer: 'grantee' });
+    // A file uploaded by a third party, shared with the recipient
+    // (the listing owner) for another purpose, under no grant.
+    const thirdFile = seedFile(w, 3, 'r2-x1-third', 'third.txt', 'text/plain', 'Notes a third party shared for another purpose.');
+    const genericShare = await w.call('POST', `/api/v1/exchange/files/${thirdFile}/share`, { key: KEY.third_bot, body: { recipient_usernames: ['owner_bot'] } });
+    assert(genericShare.status === 200, 'a general share records');
+    const attack = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.borrower_bot, body: { result_file_id: thirdFile } });
+    assert(attack.status === 403, 'a file shared for another purpose cannot be attached to this grant, got ' + attack.status + ' ' + attack.text);
+    assert(sqlOne(w, 'SELECT status FROM exchange_grants WHERE public_ref = ?', grant.ref).status === 'active', 'the grant is untouched by the refused attachment');
+    // The same file, with a share recorded for THIS grant, attaches.
+    const scopedShare = await w.call('POST', `/api/v1/exchange/files/${thirdFile}/share`, { key: KEY.third_bot, body: { recipient_usernames: ['owner_bot'], grant_ref: grant.ref } });
+    assert(scopedShare.status === 200, 'a grant-scoped share records');
+    const done = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.borrower_bot, body: { result_file_id: thirdFile } });
+    assert(done.status === 200, 'with a share recorded for this grant, attachment lands, got ' + done.status + ' ' + done.text);
+    // The completion declarer did not upload the file: no download.
+    const declarerDl = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, { key: KEY.borrower_bot });
+    assert(declarerDl.status === 404, 'the completion declarer who did not upload the file cannot download it, got ' + declarerDl.status);
+    const recipientDl = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, { key: KEY.owner_bot });
+    assert(recipientDl.status === 200 && recipientDl.text.includes('another purpose'), 'the recipient the result was delivered to downloads it');
+  });
+
+  await section('X2 human-session: gate before password, one error, rate limited', async () => {
+    const w = await makeWorld({ pilot: 'owner_bot' });
+    const wrongPw = await w.call('POST', '/api/v1/exchange/human-session', { idem: false, body: { username: 'owner_bot', password: 'not-the-password' } });
+    const nonPilot = await w.call('POST', '/api/v1/exchange/human-session', { idem: false, body: { username: 'borrower_bot', password: PASSWORD } });
+    const unknown = await w.call('POST', '/api/v1/exchange/human-session', { idem: false, body: { username: 'ghost_bot', password: PASSWORD } });
+    assert(wrongPw.status === 401, 'wrong password is 401');
+    assert(nonPilot.status === wrongPw.status && JSON.stringify(nonPilot.json) === JSON.stringify(wrongPw.json),
+      'a correct password on a non-pilot account answers identically to a wrong password (no oracle)');
+    assert(unknown.status === wrongPw.status && JSON.stringify(unknown.json) === JSON.stringify(wrongPw.json),
+      'an unknown account answers identically too');
+    const w2 = await makeWorld();
+    for (let i = 0; i < 31; i++) {
+      await w2.call('POST', '/api/v1/exchange/human-session', { idem: false, body: { username: 'owner_bot', password: 'attempt-' + i } });
+    }
+    const limited = await w2.call('POST', '/api/v1/exchange/human-session', { idem: false, body: { username: 'owner_bot', password: PASSWORD } });
+    assert(limited.status === 401 && JSON.stringify(limited.json) === JSON.stringify(wrongPw.json),
+      'past the rate limit even the correct password gets the same answer, got ' + limited.status + ' ' + limited.text);
+  });
+
+  await section('X3 exit match precision (agent 1 vs 12) + X5 grant view cut on exit', async () => {
+    const w = await makeWorld();
+    const create = await w.call('POST', '/api/v1/exchange/channels', {
+      key: KEY.owner_bot, body: { name: 'Precision channel', purpose: 'Exit matching checks.', invitees: ['swarm_01', 'swarm_02'] },
+    });
+    assert(create.status === 201, 'channel creates, got ' + create.status + ' ' + create.text);
+    const ch = create.json.channel;
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.swarm_01, body: {} });
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.swarm_02, body: {} });
+    const listing = await makeLiveListing(w, 'owner_bot', { kind: 'own_compute', title: 'GPU window', audience: 'channel', channel_ref: ch.ref });
+    const req = await fileRequest(w, 'swarm_01', listing.ref, { channel_ref: ch.ref, grantee_type: 'channel', grantee_channel_ref: ch.ref });
+    const { grant } = await approveAndGrant(w, 'owner_bot', listing.human, req.ref, { performer: 'grantee' });
+    assert(JSON.stringify([...grant.grantees].sort()) === JSON.stringify(['owner_bot', 'swarm_01', 'swarm_02']),
+      'the fixed set names agents 1, 11 and 12, got ' + JSON.stringify(grant.grantees));
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/remove`, { key: KEY.owner_bot, body: { username: 'swarm_02' } });
+    const cutView = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}`, { key: KEY.swarm_02 });
+    assert(cutView.json.projection === 'state_only' && !('scope' in cutView.json.grant),
+      'an exited grantee loses the full grant view (X5), got ' + JSON.stringify(cutView.json));
+    const removedDone = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.swarm_02, body: {} });
+    assert(removedDone.status === 403, 'agent 12 cannot act after exit');
+    const ownerDone = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.owner_bot, body: {} });
+    assert(ownerDone.status === 200, 'agent 1 is not cut by agent 12 exit row (no prefix collision), got ' + ownerDone.status + ' ' + ownerDone.text);
+  });
+
+  await section('X4 owner survives grant + X5 snapshot at approval time', async () => {
+    const w = await makeWorld();
+    const ch = await channelSetup(w);
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.borrower_bot, body: {} });
+    const listing = await makeLiveListing(w, 'owner_bot', { kind: 'own_compute', title: 'GPU window', audience: 'channel', channel_ref: ch.ref });
+    const req = await fileRequest(w, 'borrower_bot', listing.ref, { channel_ref: ch.ref, grantee_type: 'channel', grantee_channel_ref: ch.ref });
+    // Membership changes AFTER filing, BEFORE approval: third joins,
+    // borrower leaves. The approval snapshot is the membership now.
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.third_bot, body: {} });
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/leave`, { key: KEY.borrower_bot, body: {} });
+    const { grant } = await approveAndGrant(w, 'owner_bot', listing.human, req.ref, { performer: 'grantee' });
+    assert(JSON.stringify([...grant.grantees].sort()) === JSON.stringify(['owner_bot', 'third_bot']),
+      'the grantee snapshot is taken at approval, got ' + JSON.stringify(grant.grantees));
+    const reqRow = sqlOne(w, 'SELECT owner_agent_id, performer_agent_id FROM exchange_requests WHERE public_ref = ?', req.ref);
+    assert(reqRow.owner_agent_id === 1, 'the listing owner is still the request owner after a grantee-performer grant (X4)');
+    assert(reqRow.performer_agent_id === 2, 'the performer principal is in its own column');
+    const ownerView = await w.call('GET', `/api/v1/exchange/requests/${req.ref}`, { key: KEY.owner_bot });
+    assert(ownerView.status === 200 && ownerView.json.request.owner === 'owner_bot', 'the listing owner keeps full request access');
+  });
+
+  await section('X5 base room route writes an Exchange audit row (audit option)', async () => {
+    const w = await makeWorld();
+    const ch = await channelSetup(w);
+    const roomId = sqlOne(w, 'SELECT room_id FROM exchange_channels WHERE public_ref = ?', ch.ref).room_id;
+    const add = await w.call('POST', `/api/rooms/${roomId}/members`, { key: KEY.owner_bot, idem: false, body: { to: 'late_bot' } });
+    assert(add.status === 200, 'base room add works, got ' + add.status + ' ' + add.text);
+    const row = sqlOne(w, "SELECT detail_json FROM exchange_audit WHERE object_kind = 'channel' AND action = 'member_joined' AND object_id = (SELECT id FROM exchange_channels WHERE public_ref = ?)", ch.ref);
+    assert(row && JSON.parse(row.detail_json).agent_id === 6, 'the base-route join is in the Exchange audit trail for the linked channel');
+    const view = await w.call('GET', `/api/v1/exchange/channels/${ch.ref}`, { key: KEY.late_bot });
+    assert(view.status === 200, 'an agent added through the base route is a channel member');
+  });
+
+  await section('X6 draft report leaks no ref + share-consent needs membership', async () => {
+    const w = await makeWorld();
+    const create = await w.call('POST', '/api/v1/exchange/listings', { key: KEY.owner_bot, body: { kind: 'own_service', title: 'Draft pass', description: 'Not yet live.' } });
+    assert(create.status === 201, 'draft creates');
+    const draftRef = create.json.listing.ref;
+    const report = await w.call('POST', '/api/v1/exchange/reports', { key: KEY.borrower_bot, body: { listing_ref: draftRef, reason: 'Checking the draft path.' } });
+    assert(report.status === 404 && !JSON.stringify(report.json).includes(draftRef), 'reporting a draft answers 404 and returns no ref, got ' + report.status + ' ' + report.text);
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Consent pass' });
+    const req = await fileRequest(w, 'borrower_bot', listing.ref);
+    const { grant } = await approveAndGrant(w, 'owner_bot', listing.human, req.ref, {});
+    await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.owner_bot, body: {} });
+    const conf = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/confirm`, { key: KEY.borrower_bot, body: {} });
+    assert(conf.status === 200 && conf.json.receipt.ref, 'a receipt exists for the consent check');
+    const ch = await channelSetup(w);
+    const notMember = await w.call('POST', `/api/v1/exchange/receipts/${conf.json.receipt.ref}/share-consent`, { key: KEY.borrower_bot, body: { channel_ref: ch.ref } });
+    assert(notMember.status === 404 && !JSON.stringify(notMember.json).includes(ch.ref), 'share-consent by a non-member answers 404 and returns no channel ref, got ' + notMember.status);
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.borrower_bot, body: {} });
+    const member = await w.call('POST', `/api/v1/exchange/receipts/${conf.json.receipt.ref}/share-consent`, { key: KEY.borrower_bot, body: { channel_ref: ch.ref } });
+    assert(member.status === 200 && member.json.channel_ref === ch.ref, 'share-consent by a member records and returns the ref');
+  });
+
+  await section('X8 grant/result expiry holds with the sweep disabled', async () => {
+    const w = await makeWorld({ sweepOff: true });
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Expiry pass' });
+    const fileId = seedFile(w, 1, 'r2-x8-result', 'result.txt', 'text/plain', 'Result body for the expiry check.');
+    const req = await fileRequest(w, 'borrower_bot', listing.ref);
+    const { grant } = await approveAndGrant(w, 'owner_bot', listing.human, req.ref, {});
+    const done = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.owner_bot, body: { result_file_id: fileId } });
+    assert(done.status === 200, 'done lands');
+    const before = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, { key: KEY.borrower_bot });
+    assert(before.status === 200, 'the result downloads before expiry');
+    w.db.prepare('UPDATE exchange_grants SET expires_at = ? WHERE public_ref = ?').run(new Date(Date.now() - 60000).toISOString(), grant.ref);
+    const after = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, { key: KEY.borrower_bot });
+    assert(after.status === 404, 'past expiry the result handler itself refuses, sweep or no sweep, got ' + after.status);
+    assert(sqlOne(w, 'SELECT status FROM exchange_grants WHERE public_ref = ?', grant.ref).status === 'done',
+      'the stored status never moved: the sweep really was off for this world');
+  });
+
+  await section('D5 reserve-first idempotency: an in-flight key blocks a second run', async () => {
+    const w = await makeWorld();
+    const body = { kind: 'own_service', title: 'Reserve pass', description: 'A pass for the reserve-first check.' };
+    const hash = await sha256hex(JSON.stringify({ description: body.description, kind: body.kind, title: body.title }));
+    w.db.prepare("INSERT INTO exchange_idempotency (actor_agent_id, operation, target_ref, idempotency_key, payload_hash, response_status, response_body, created_at) VALUES (1, 'listing.create', '', 'inflight-1', ?, 0, '', ?)")
+      .run(hash, new Date().toISOString());
+    const second = await w.call('POST', '/api/v1/exchange/listings', { key: KEY.owner_bot, idem: 'inflight-1', body });
+    assert(second.status === 409 && second.json.error === 'idempotency_conflict', 'a second call with an in-flight key loses the race, got ' + second.status + ' ' + second.text);
+    assert(sqlOne(w, 'SELECT COUNT(*) AS n FROM exchange_listings').n === 0, 'the losing call did no work');
+  });
+}
+
 
 // ===========================================================================
 // Fixtures E1-E7 (build spec §10, with Dot delta coverage)
@@ -962,12 +1140,24 @@ async function fixtures() {
       'later joiner sees state only, never the object');
     const lateDone = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.late_bot, body: {} });
     assert(lateDone.status === 403, 'later joiner cannot act under the grant');
+    // X8: setup for the replay-after-removal assert below — a filing
+    // by third_bot under a fixed idempotency key while still a member.
+    const replayBody = { listing_ref: listing.ref, scope: 'One window for replay checks.', purpose: 'Replay check.', channel_ref: ch.ref };
+    const filedReplay = await w.call('POST', '/api/v1/exchange/requests', { key: KEY.third_bot, idem: 'e5-replay-key', body: replayBody });
+    assert(filedReplay.status === 201, 'pre-removal filing for the replay check lands, got ' + filedReplay.status + ' ' + filedReplay.text);
     const fixedAfter = sqlOne(w, 'SELECT grantee_ids FROM exchange_grants WHERE public_ref = ?', grant.ref);
     assert(JSON.stringify(JSON.parse(fixedAfter.grantee_ids)) === JSON.stringify([1, 2, 3]), 'the stored set did not move when membership did');
     // Removal ends act authority at once; rejoin does not restore it.
     await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/remove`, { key: KEY.owner_bot, body: { username: 'third_bot' } });
     const removedDone = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.third_bot, body: {} });
     assert(removedDone.status === 403, 'a removed member cannot act under the grant');
+    // X8: replay after removal asserts — the stored response is
+    // re-authorized, and a removed member no longer passes the
+    // listing audience check, so the replay is refused, not served.
+    const replayed = await w.call('POST', '/api/v1/exchange/requests', { key: KEY.third_bot, idem: 'e5-replay-key', body: replayBody });
+    assert(replayed.status === 404, 'replay after removal is re-authorized and refused, got ' + replayed.status + ' ' + replayed.text);
+    assert(sqlOne(w, "SELECT COUNT(*) AS n FROM exchange_requests WHERE requester_agent_id = 3 AND scope = 'One window for replay checks.'").n === 1,
+      'the refused replay created no second request');
     await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/invite`, { key: KEY.owner_bot, body: { username: 'third_bot' } });
     await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.third_bot, body: {} });
     const rejoinDone = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.third_bot, body: {} });
@@ -1095,8 +1285,8 @@ async function fixtures() {
     const modFile = seedFile(w2, 7, 'r2-mod-file', 'notes.txt', 'text/plain', 'Clean notes from the mod queue.');
     const noShare = await w2.call('POST', `/api/v1/exchange/grants/${gA.grant.ref}/done`, { key: KEY.oidsadmin, body: { result_file_id: modFile } });
     assert(noShare.status === 403, 'a readable-but-not-shareable file cannot be attached');
-    const share = await w2.call('POST', `/api/v1/exchange/files/${modFile}/share`, { key: KEY.mod_bot, body: { recipient_usernames: ['borrower_bot'] } });
-    assert(share.status === 200, 'the uploader records share authority');
+    const share = await w2.call('POST', `/api/v1/exchange/files/${modFile}/share`, { key: KEY.mod_bot, body: { recipient_usernames: ['borrower_bot'], grant_ref: gA.grant.ref } });
+    assert(share.status === 200, 'the uploader records share authority for this grant');
     const withShare = await w2.call('POST', `/api/v1/exchange/grants/${gA.grant.ref}/done`, { key: KEY.oidsadmin, body: { result_file_id: modFile } });
     assert(withShare.status === 200, 'with share authority recorded, attachment lands, got ' + withShare.status + ' ' + withShare.text);
     const dl = await w2.call('GET', `/api/v1/exchange/grants/${gA.grant.ref}/result`, { key: KEY.borrower_bot });
@@ -1147,6 +1337,7 @@ async function main() {
   await acceptance();
   await channelsAndMultiParty();
   await fixtures();
+  await gateRound2();
   const failed = results.filter(([, s]) => s !== 'PASS');
   console.log('');
   for (const [name, s] of results) console.log((s === 'PASS' ? 'PASS ' : 'FAIL ') + name + (s === 'PASS' ? '' : ' — ' + s.slice(5)));
