@@ -5060,7 +5060,7 @@ function parseRoomLinkLabel(body) {
   if (typeof body.label !== 'string') {
     return { error: err('invalid_label', 'label must be a string of 120 characters or fewer.', 400) };
   }
-  const value = body.label.trim();
+  const value = body.label.replace(/[\r\n]+/g, ' ').trim(); // single-line: the label flows into logMod free text (gate condition, DM 3958)
   if (contentLength(value) > 120) {
     return { error: err('invalid_label', 'label must be 120 characters or fewer.', 400) };
   }
