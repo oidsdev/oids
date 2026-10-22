@@ -252,7 +252,14 @@ function establishOperator(w, agentId, operatorId) {
     .run(agentId, operatorId, past);
 }
 let slugCounter = 0;
+function ensureOperatorMapping(w, ownerName) {
+  const row = AGENTS.find((a) => a[1] === ownerName);
+  if (!row) return;
+  w.db.prepare('INSERT INTO agent_operators (agent_id, operator_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(agent_id) DO NOTHING')
+    .run(row[0], 'op_' + ownerName, new Date().toISOString());
+}
 async function makeDoor(w, ownerName, listingRef, opts = {}) {
+  ensureOperatorMapping(w, ownerName);
   const slug = opts.slug || ('door-' + (++slugCounter) + '-' + Math.random().toString(36).slice(2, 7));
   const r = await w.call('POST', '/api/v1/doors', {
     key: KEY[ownerName], idem: opts.idem,
@@ -858,9 +865,182 @@ async function fixtures() {
   });
 }
 
+
+// ===========================================================================
+// Gate round 2 (2026-10-22): D1-D5 + conditions + Q3/Q4 coverage
+// ===========================================================================
+async function gateRound2Doors() {
+  await section('D1 dotted and encoded hosts fail the entry_url checks', async () => {
+    const w = await makeWorld();
+    establishOperator(w, 1, 'op_owner');
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Dotted host service' });
+    const bad = [
+      ['https://tryoids.com./e', 'a dotted Oids host'],
+      ['https://api.tryoids.com./e', 'a dotted Oids subdomain'],
+      ['https://localhost./e', 'a dotted localhost'],
+      ['https://service.internal./e', 'a dotted internal host'],
+      ['https://doors.example%2ecom.evil.com/e', 'an encoded dot in the host'],
+      ['https://example.com%2Eevil.com/e', 'an uppercase encoded dot in the host'],
+    ];
+    for (const [url, label] of bad) {
+      const r = await w.call('POST', '/api/v1/doors', { key: KEY.owner_bot, body: { listing_ref: listing.ref, slug: 'dot-door', entry_url: url, terms_ack: true } });
+      assert(r.status === 400 && r.json.error === 'bad_entry_url', label + ' is rejected, got ' + r.status + ' ' + r.text);
+    }
+    assert(sqlOne(w, 'SELECT COUNT(*) AS n FROM doors').n === 0, 'no door from a dotted or encoded host');
+    const okDoor = await makeDoor(w, 'owner_bot', listing.ref, { slug: 'dot-door', entry_url: 'https://doors.example.com./entry' });
+    assert(okDoor.door.entry_domain === 'example.com', 'one trailing dot on a public host is normalized away, domain is ' + okDoor.door.entry_domain);
+  });
+
+  await section('D2 Exchange PATCH on a door listing re-runs all three screens', async () => {
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Plain patch service', description: 'A plain service description.' });
+    await makeDoor(w, 'owner_bot', listing.ref, { slug: 'patch-door' });
+    const supportTitle = 'Oids ' + 'Sup' + 'port';
+    const badTitle = await w.call('PATCH', `/api/v1/exchange/listings/${listing.ref}`, { key: KEY.owner_bot, body: { title: supportTitle } });
+    assert(badTitle.status === 400 && badTitle.json.error === 'bad_door_name', 'an official-style title edit is refused, got ' + badTitle.status + ' ' + badTitle.text);
+    const wagerDesc = await w.call('PATCH', `/api/v1/exchange/listings/${listing.ref}`, { key: KEY.owner_bot, body: { description: 'Now with a weekly lottery draw for the room.' } });
+    assert(wagerDesc.status === 400 && wagerDesc.json.error === 'door_terms_violation', 'a door-terms edit is refused, got ' + wagerDesc.status + ' ' + wagerDesc.text);
+    const barredTitle = 'The ' + 'Red' + ' Dragon' + ' Inn';
+    const barred = await w.call('PATCH', `/api/v1/exchange/listings/${listing.ref}`, { key: KEY.owner_bot, body: { title: barredTitle } });
+    assert(barred.status === 400 && barred.json.error === 'bad_door_name', 'a barred-name title edit is refused, got ' + barred.status);
+    const row = sqlOne(w, 'SELECT title, description FROM exchange_listings WHERE public_ref = ?', listing.ref);
+    assert(row.title === 'Plain patch service' && row.description === 'A plain service description.', 'none of the refused edits were stored');
+    const clean = await w.call('PATCH', `/api/v1/exchange/listings/${listing.ref}`, { key: KEY.owner_bot, body: { title: 'Plain patch service, renamed' } });
+    assert(clean.status === 200, 'a clean edit still lands, got ' + clean.status + ' ' + clean.text);
+    // The strengthened impersonation screen also guards registration:
+    const listing2 = await makeLiveListing(w, 'owner_bot', { title: 'Second plain service' });
+    const trySlug = 'try' + 'oids-help';
+    const badSlug = await w.call('POST', '/api/v1/doors', { key: KEY.owner_bot, body: { listing_ref: listing2.ref, slug: trySlug, entry_url: 'https://doors.example.com/e', terms_ack: true } });
+    assert(badSlug.status === 400, 'a tryoids-style slug is refused at registration, got ' + badSlug.status);
+    const supportListing = await makeLiveListing(w, 'owner_bot', { title: supportTitle });
+    const badDoor = await w.call('POST', '/api/v1/doors', { key: KEY.owner_bot, body: { listing_ref: supportListing.ref, slug: 'plain-second', entry_url: 'https://doors.example.com/e', terms_ack: true } });
+    assert(badDoor.status === 400, 'an official-style title is refused at registration, got ' + badDoor.status);
+  });
+
+  await section('D3 private suffixes make different registrable domains', async () => {
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Platform hosted service' });
+    await makeDoor(w, 'owner_bot', listing.ref, { slug: 'platform-door', entry_url: 'https://alice.github.io/entry' });
+    const sameTenant = await w.call('PATCH', `/api/v1/doors/${listing.ref}`, { key: KEY.owner_bot, body: { entry_url: 'https://alice.github.io/other' } });
+    assert(sameTenant.status === 200 && !sameTenant.json.door.paused_for_reattestation, 'a move within one tenant name is not a domain change');
+    const otherTenant = await w.call('PATCH', `/api/v1/doors/${listing.ref}`, { key: KEY.owner_bot, body: { entry_url: 'https://bob.github.io/entry' } });
+    assert(otherTenant.status === 200 && otherTenant.json.door.paused_for_reattestation === true,
+      'a move to another tenant on the same platform suffix IS a domain change, got ' + JSON.stringify(otherTenant.json.door));
+    const listingRow = sqlOne(w, 'SELECT entry_domain FROM doors WHERE slug = ?', 'platform-door');
+    assert(listingRow.entry_domain === 'bob.github.io', 'the stored registrable domain is the tenant domain, got ' + listingRow.entry_domain);
+  });
+
+  await section('D5 reserve-first idempotency on door writes', async () => {
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Reserve door service' });
+    const body = { listing_ref: listing.ref, slug: 'reserve-door', entry_url: 'https://doors.example.com/entry', entry_mode: 'grant', session_max_minutes: 60, terms_ack: true };
+    const sorted = { entry_mode: body.entry_mode, entry_url: body.entry_url, listing_ref: body.listing_ref, session_max_minutes: body.session_max_minutes, slug: body.slug, terms_ack: body.terms_ack };
+    const hash = await sha256hex(JSON.stringify(sorted));
+    w.db.prepare("INSERT INTO exchange_idempotency (actor_agent_id, operation, target_ref, idempotency_key, payload_hash, response_status, response_body, created_at) VALUES (1, 'door.create', ?, 'door-inflight-1', ?, 0, '', ?)")
+      .run(listing.ref, hash, new Date().toISOString());
+    const second = await w.call('POST', '/api/v1/doors', { key: KEY.owner_bot, idem: 'door-inflight-1', body });
+    assert(second.status === 409 && second.json.error === 'idempotency_conflict', 'a second call with an in-flight key loses the race, got ' + second.status + ' ' + second.text);
+    assert(sqlOne(w, 'SELECT COUNT(*) AS n FROM doors').n === 0, 'the losing call created no door');
+  });
+
+  await section('Condition (a): creating a door requires an operator mapping', async () => {
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'late_bot', { title: 'Unmapped service' });
+    const r = await w.call('POST', '/api/v1/doors', { key: KEY.late_bot, body: { listing_ref: listing.ref, slug: 'unmapped-door', entry_url: 'https://doors.example.com/e', terms_ack: true } });
+    assert(r.status === 400 && r.json.error === 'operator_mapping_required', 'an unmapped agent is refused, got ' + r.status + ' ' + r.text);
+    assert(sqlOne(w, 'SELECT COUNT(*) AS n FROM doors').n === 0, 'no door for the unmapped agent');
+    establishOperator(w, 6, 'op_late');
+    const ok = await w.call('POST', '/api/v1/doors', { key: KEY.late_bot, body: { listing_ref: listing.ref, slug: 'unmapped-door', entry_url: 'https://doors.example.com/e', terms_ack: true } });
+    assert(ok.status === 201, 'once mapped, the same registration lands, got ' + ok.status + ' ' + ok.text);
+  });
+
+  await section('Q3 tenure counts from the current operator mapping only', async () => {
+    const w = await makeWorld();
+    establishOperator(w, 1, 'op_previous');
+    const l1 = await makeLiveListing(w, 'owner_bot', { title: 'Tenure service one' });
+    await makeDoor(w, 'owner_bot', l1.ref, { slug: 'tenure-door-1' });
+    const l2 = await makeLiveListing(w, 'owner_bot', { title: 'Tenure service two' });
+    await makeDoor(w, 'owner_bot', l2.ref, { slug: 'tenure-door-2' });
+    // Remap to a NEW operator, mapped just now: the earlier history
+    // is ignored, so the operator is in its first week again.
+    w.db.prepare("UPDATE agent_operators SET operator_id = 'op_current', updated_at = ? WHERE agent_id = 1").run(new Date().toISOString());
+    const l3 = await makeLiveListing(w, 'owner_bot', { title: 'Tenure service three' });
+    const third = await w.call('POST', '/api/v1/doors', { key: KEY.owner_bot, body: { listing_ref: l3.ref, slug: 'tenure-door-3', entry_url: 'https://doors.example.com/e', terms_ack: true } });
+    assert(third.status === 400 && third.json.error === 'door_cap_reached',
+      'under the current mapping the operator is in week one (cap 1, already used by a live door), got ' + third.status + ' ' + third.text);
+  });
+
+  await section('Q4 newly flagged shorteners are refused', async () => {
+    const w = await makeWorld();
+    establishOperator(w, 1, 'op_owner');
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Shortener check service' });
+    const hosts = ['bitly.com', 'j.mp', 'linktr.ee', 'surl.li', 'lnk.to'];
+    for (const h of hosts) {
+      const url = 'https://' + h + '/abc123';
+      const r = await w.call('POST', '/api/v1/doors', { key: KEY.owner_bot, body: { listing_ref: listing.ref, slug: 'short-door', entry_url: url, terms_ack: true } });
+      assert(r.status === 400 && r.json.error === 'bad_entry_url', h + ' is refused, got ' + r.status + ' ' + r.text);
+    }
+    assert(sqlOne(w, 'SELECT COUNT(*) AS n FROM doors').n === 0, 'no door on a flagged shortener');
+  });
+
+  await section('Condition (b): door audit rows lose agent ids at 90 days', async () => {
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Retention service' });
+    await makeDoor(w, 'owner_bot', listing.ref, { slug: 'retention-door' });
+    const listingId = sqlOne(w, 'SELECT id FROM exchange_listings WHERE public_ref = ?', listing.ref).id;
+    const old = new Date(Date.now() - 100 * 86400000).toISOString();
+    w.db.prepare("INSERT INTO exchange_audit (object_kind, object_id, actor_agent_id, action, detail_json, created_at) VALUES ('listing', ?, 2, 'door_entry_minted', ?, ?)")
+      .run(listingId, JSON.stringify({ listing_id: listingId }), old);
+    await w.call('GET', '/api/v1/doors', { key: KEY.borrower_bot });
+    const row = sqlOne(w, "SELECT actor_agent_id FROM exchange_audit WHERE action = 'door_entry_minted' AND object_id = ?", listingId);
+    assert(row && row.actor_agent_id === null, 'the sweep stripped the agent id from the 90-day-old door audit row');
+    const fresh = sqlOne(w, "SELECT actor_agent_id FROM exchange_audit WHERE action = 'door_created' AND object_id = ?", listingId);
+    assert(fresh && fresh.actor_agent_id === 1, 'recent door audit rows keep their actor');
+  });
+
+  await section('Condition (c): validate/exit rate limits, sweeps off the validate path', async () => {
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Limit door service' });
+    const door = await makeDoor(w, 'owner_bot', listing.ref, { slug: 'limit-door', session_max_minutes: 30 });
+    await grantFor(w, 'owner_bot', listing.human, listing.ref, 'borrower_bot');
+    const e1 = await enterDoor(w, 'borrower_bot', listing.ref);
+    assert(e1.status === 201, 'entry mints');
+    const v1 = await validateToken(w, door.validate_key, e1.json.entry.token, listing.ref);
+    assert(v1.json.valid === true, 'the entry validates');
+    // A lapsed session is NOT swept by a validate call...
+    w.db.prepare('UPDATE door_entries SET session_expires_at = ? WHERE public_ref = ?').run(new Date(Date.now() - 60000).toISOString(), e1.json.entry.ref);
+    const badValidate = await validateToken(w, door.validate_key, 'not-a-real-token', listing.ref);
+    assert(badValidate.json.valid === false, 'a bad token is invalid');
+    const unswept = sqlOne(w, 'SELECT exited_at, exit_source FROM door_entries WHERE public_ref = ?', e1.json.entry.ref);
+    assert(unswept.exited_at === null, 'validate did not run the sweep');
+    // ...but the next ordinary door route sweeps it.
+    await w.call('GET', '/api/v1/doors', { key: KEY.borrower_bot });
+    const swept = sqlOne(w, 'SELECT exited_at, exit_source FROM door_entries WHERE public_ref = ?', e1.json.entry.ref);
+    assert(swept.exit_source === 'sweep', 'the sweep still runs on ordinary door routes');
+    // Validate rate limit: past the per-door cap, even a genuine
+    // token answers the same indistinguishable {valid:false}.
+    const e2 = await enterDoor(w, 'borrower_bot', listing.ref);
+    assert(e2.status === 201, 'second entry mints');
+    for (let i = 0; i < 300; i++) {
+      const r = await validateToken(w, door.validate_key, 'filler-token-' + i, listing.ref);
+      assert(r.json.valid === false, 'filler validation ' + i + ' is invalid');
+    }
+    const limited = await validateToken(w, door.validate_key, e2.json.entry.token, listing.ref);
+    assert(limited.json.valid === false && Object.keys(limited.json).length === 1, 'a genuine token past the validate cap is refused indistinguishably');
+    // Exit rate limit: the 121st exit call in the minute is a 429.
+    let lastExit = null;
+    for (let i = 0; i < 121; i++) {
+      lastExit = await w.call('POST', `/api/v1/doors/sessions/${e1.json.entry.ref}/exit`, { key: 'wrong-key', idem: false, body: {} });
+    }
+    assert(lastExit.status === 429, 'exit calls are rate-limited, got ' + lastExit.status);
+  });
+}
+
+
 await acceptance();
 await conditions();
 await fixtures();
+await gateRound2Doors();
 
 const failed = results.filter(([, s]) => s !== 'PASS');
 console.log('');
