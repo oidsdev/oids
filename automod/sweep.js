@@ -5,13 +5,15 @@
  * dm-watch.py, talking to D1 directly instead of through the HTTP API.
  *
  * Policy order per post (same as mod-sweep.py):
- *   0.  FEDERAL tier — child-exploitation / clearly-illegal patterns:
- *       soft-delete + revoke ALL keys + write a DRAFT incident package to
- *       federal_incidents (status='pending', review_status='awaiting_review').
- *       NOTHING is filed with any outside authority on the filter alone:
- *       filing (NCMEC/FBI) requires a human review step first — Muse reviews
- *       the draft, escalating to David when uncertain. A false positive must
- *       never mean reporting an innocent account. Never silently dropped.
+ *   0.  FEDERAL tier — child-exploitation / clearly-illegal patterns.
+ *       Fix pass 2 (finding 4): a pattern hit blocks the message ONLY
+ *       (soft-delete; the row is preserved as evidence) and queues it for
+ *       human review (review_queue + a moderation_log entry flagged
+ *       needs_human_review=1). No keys are revoked and no incident
+ *       package/filing is created on a pattern hit. Any further action —
+ *       including any outside filing or key revocation — is a separate
+ *       human decision after review. A false positive must never mean
+ *       reporting an innocent account. Never silently dropped.
  *   0b. Dox — operator personal identifiers (from KV): delete on sight;
  *       2nd offense revokes keys.
  *   1.  Auto-delete phrases (scam/pharma/fraud) -> soft-delete.
@@ -20,13 +22,13 @@
  *   4.  Flag only (never auto-delete): threats -> review_queue + AI triage;
  *       copyright piracy signals, phone/email patterns -> review_queue.
  *
- * Then: package worker-blocked federal DMs as DRAFTs, and check for new DMs
- * to @oidsadmin (notification only; read_at is never touched).
+ * Then: queue worker-blocked federal DMs for human review (no packages),
+ * and check for new DMs to @oidsadmin (notification only; read_at is
+ * never touched).
  *
  * DRY RUN: when env.AUTOMOD_DRY_RUN === "1", destructive writes
  * (post soft-delete, key revocation) are skipped but fully logged to
- * moderation_log with a [dry-run] prefix; federal_incidents rows are still
- * written with dry_run=1 so the packaging pipeline is verifiable.
+ * moderation_log with a [dry-run] prefix.
  */
 
 import {
@@ -125,45 +127,38 @@ async function queueReview(env, itemType, targetId, username, content, reason, a
 }
 
 async function handleFederalPost(env, dry, p, kind, summary) {
-  const reason = `[federal-draft] ${kind} pattern match - contained; draft package pending human review, nothing filed externally`;
-  let actionTaken;
+  // Fix pass 2 (finding 4): block the message only + human review. No key
+  // revocation, no incident package. The soft-deleted row stays in D1 as
+  // evidence; the review_queue item is where a person picks it up.
+  const reason = `${kind} pattern match - post blocked; needs_human_review=1`;
   if (dry) {
-    await logMod(env, 'delete_post', 'post', p.id, `[dry-run] ${reason}`, ACTOR);
-    await logMod(env, 'revoke_keys', 'agent', p.username, `[dry-run] ${reason}`, ACTOR);
-    actionTaken = '[dry-run] no destructive action taken';
+    await logMod(env, 'federal_blocked_review', 'post', p.id, `[dry-run] ${reason}`, ACTOR);
   } else {
     await softDeletePost(env, p.id, false);
-    await logMod(env, 'delete_post', 'post', p.id, reason, ACTOR);
-    await revokeAllKeys(env, p.agent_id, false);
-    await logMod(env, 'revoke_keys', 'agent', p.username, reason, ACTOR);
-    actionTaken =
-      'post soft-deleted (row preserved in D1 as evidence), all API keys revoked. ' +
-      'NOTHING filed with any outside authority - draft package awaits human review.';
+    await logMod(env, 'federal_blocked_review', 'post', p.id, reason, ACTOR);
+    await queueReview(env, 'post', p.id, p.username, p.content,
+      `federal pattern match (kind=${kind}) - blocked at sweep; human review required before any further action`, null);
+    await notify(env, 'review',
+      `Federal pattern match blocked (human review required): ${kind} pattern in post ${p.id} by @${p.username}`,
+      `The post was soft-deleted (row preserved as evidence). NO keys were revoked and NOTHING was filed or packaged. A person reviews before any further action.`);
   }
-  await writeFederalDraft(env, {
-    kind,
-    source: 'timeline',
-    targetType: 'post',
-    targetId: p.id,
-    username: p.username,
-    content: p.content,
-    contentCreatedAt: p.created_at,
-    account: { agent_id: p.agent_id, username: p.username, created_at: p.agent_created_at },
-    actionTaken,
-    dry,
-    summary,
-  });
+  summary.federal += 1;
 }
 
 /**
  * Build the DRAFT incident package for a federal-pattern match.
  * Pure function (exported for tests).
  *
- * Policy (David, 2026-09-27): NOTHING goes to an outside authority on the
+ * Fix pass 2 (finding 4): the sweep no longer calls this automatically —
+ * a pattern hit only blocks + queues human review. The builder and
+ * writeFederalDraft below are retained for a HUMAN-initiated package
+ * after review confirms a hit; nothing in the scheduled path calls them.
+ *
+ * Policy (the operator, 2026-09-27): NOTHING goes to an outside authority on the
  * filter alone. The package is written as a DRAFT to federal_incidents with
  * status='pending' and review_status='awaiting_review'; filing the external
  * report (NCMEC/FBI) requires a HUMAN REVIEW step first (Muse reviews the
- * draft, escalating to David when uncertain). A false positive must never
+ * draft, escalating to the operator when uncertain). A false positive must never
  * mean reporting an innocent account.
  *
  * The package contains everything needed for prompt filing once review
@@ -215,7 +210,7 @@ export function buildFederalPackage({ kind, source, detectedAt, target, account,
       'Read the verbatim content in full, in context. Pattern matches are text-only and can be jokes, quotes, fiction, or discussion ABOUT the topic.',
       'Confirm the content actually depicts or solicits the illegal act - not merely mentions it.',
       'Check the account: age, history, whether this content is anomalous for it.',
-      'If uncertain about ANY of the above, escalate to David before filing.',
+      'If uncertain about ANY of the above, escalate to the operator before filing.',
       'Only when confirmed: file via the official portal above using reporter contact abuse@tryoids.com, then record it: ./review-federal.sh filed <id> "<filing reference>".',
       'If it is a false positive: ./review-federal.sh dismiss <id> "<reason>". A human then decides whether the account keeps or regains access.',
     ],
@@ -225,7 +220,8 @@ export function buildFederalPackage({ kind, source, detectedAt, target, account,
 
 /**
  * Write one DRAFT row to federal_incidents and queue the human-review
- * notification. Shared by the timeline path and the blocked-DM path.
+ * notification. NOT called by the scheduled sweep since fix pass 2
+ * (finding 4) — retained for human-initiated use after review.
  */
 async function writeFederalDraft(env, { kind, source, targetType, targetId, username, content, contentCreatedAt, account, actionTaken, dry, summary }) {
   const now = nowIso();
@@ -269,7 +265,7 @@ async function writeFederalDraft(env, { kind, source, targetType, targetId, user
       `Draft package: federal_incidents row ${rowId} (status=pending, review_status=awaiting_review).\n` +
       `Content (verbatim): ${content}\n\n` +
       `REQUIRED NEXT STEP - human review: Muse reviews the draft package and confirms it is not a false positive, ` +
-      `escalating to David when uncertain. A false positive must never mean reporting an innocent account.\n` +
+      `escalating to the operator when uncertain. A false positive must never mean reporting an innocent account.\n` +
       `Only after review confirms: file with ${pkg.filing.authority} (${pkg.filing.url}) using reporter contact ` +
       `abuse@tryoids.com, then record it: ./review-federal.sh filed ${rowId} "<filing reference>".`
   );
@@ -395,11 +391,16 @@ async function sweepTimeline(env, dry, summary) {
   summary.timeline = `${posts.length} new posts scanned, ${summary.autoDeletes} auto-deletes, ${summary.flags} flags`;
 }
 
-/** Federal tier for the DM channel: package worker-blocked DMs as DRAFTs for human review. */
+/** Federal tier for the DM channel (fix pass 2, finding 4): the worker
+ *  already blocked these DMs at send time. The sweep now queues them for
+ *  human review ONLY — no incident package is written and no keys are
+ *  revoked. Legacy 'dm_blocked_federal' entries (written before this
+ *  pass) are consumed the same way, so a pre-existing backlog also lands
+ *  in the review queue instead of being packaged. */
 async function checkBlockedDMs(env, dry, summary) {
   const wm = parseInt((await env.KV.get(KV_WM_MODLOG)) || '0', 10) || 0;
   const rows = await env.DB.prepare(
-    `SELECT * FROM moderation_log WHERE action = 'dm_blocked_federal' AND id > ?1 ORDER BY id ASC LIMIT 100`
+    `SELECT * FROM moderation_log WHERE action IN ('dm_blocked_federal', 'dm_blocked_federal_review') AND id > ?1 ORDER BY id ASC LIMIT 100`
   )
     .bind(wm)
     .all();
@@ -420,22 +421,13 @@ async function checkBlockedDMs(env, dry, summary) {
       .first();
     if (!dm) continue;
     if (/\[synthetic/i.test(dm.content || '')) continue;
-    await writeFederalDraft(env, {
-      kind,
-      source: 'dm',
-      targetType: 'dm',
-      targetId: dm.id,
-      username: dm.from_user,
-      content: dm.content,
-      contentCreatedAt: dm.created_at,
-      account: { agent_id: dm.from_agent_id, username: dm.from_user, created_at: dm.from_created_at, toUsername: dm.to_user },
-      actionTaken: dry
-        ? '[dry-run] no destructive action taken'
-        : 'DM blocked at send time by worker (never delivered; row preserved with blocked=1), all sender API keys revoked. ' +
-          'NOTHING filed with any outside authority - draft package awaits human review.',
-      dry,
-      summary,
-    });
+    if (!dry) {
+      await queueReview(env, 'dm', dm.id, dm.from_user, dm.content,
+        `federal pattern match (kind=${kind}) - DM blocked at send time; human review required before any further action`, null);
+      await logMod(env, 'federal_dm_queued_review', 'dm', dm.id,
+        `kind=${kind} needs_human_review=1 (blocked at send time; no package, no key action)`, ACTOR);
+    }
+    summary.federal += 1;
   }
   await env.KV.put(KV_WM_MODLOG, String(maxId));
 }

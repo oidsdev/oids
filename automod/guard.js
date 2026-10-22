@@ -29,7 +29,7 @@
  *
  * Honest limits (do not oversell this):
  *   - The guard reacts hourly. A fast flood can run for up to ~1 hour before
- *     the switch trips. Pair it with David's account-level usage billing
+ *     the switch trips. Pair it with the operator's account-level usage billing
  *     alerts in the Cloudflare dashboard (see README.md).
  *   - The $5/month Workers Paid base for the oids-automod worker is
  *     unavoidable (cron + Workers AI require Paid).
@@ -76,7 +76,7 @@ const DARK_KEY = 'oids:dark';
 const DEFAULT_WORKER_NAME = 'oids-automod';
 
 // ---------------------------------------------------------------------------
-// COST CIRCUIT-BREAKER (David, 2026-09-27).
+// COST CIRCUIT-BREAKER (the operator, 2026-09-27).
 //
 // The request-count tiers above react to floods. This layer projects
 // MONTH-END Cloudflare spend from metered usage and goes FULL DARK
@@ -364,7 +364,7 @@ export async function runUsageGuard(env, dry) {
 
   const result = { ran: true, tripped: false, warnTripped: false, killTripped: false, costTripped: false, total, perWorker, warnThreshold, killThreshold };
 
-  // COST CIRCUIT-BREAKER (primary — David 2026-09-27): project month-end
+  // COST CIRCUIT-BREAKER (primary — the operator, 2026-09-27): project month-end
   // spend BEFORE any overage charge is incurred. Fires ahead of the
   // request-count tiers on slow-burn overages.
   const costKillUsd = parseFloat(env.COST_KILL_USD || '') || COST_KILL_OVERAGE_USD;
@@ -436,7 +436,7 @@ export async function runUsageGuard(env, dry) {
 
   // KILL tier first (highest severity). Whichever series hits first trips.
   // Automated trips go FULL DARK (kill + dark -> API 404 on every route),
-  // per David's rule: a flood at this tier (~$10/mo overage equivalent)
+  // per the operator's rule: a flood at this tier (~$10/mo overage equivalent)
   // threatens charges above the $5 base. Manual ../kill.sh still sets only
   // oids:kill (503 "temporarily unavailable") — the operator's explicit call.
   if (peak >= killThreshold) {
