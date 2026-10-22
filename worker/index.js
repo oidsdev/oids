@@ -5569,9 +5569,19 @@ async function handleAdminRevokeRoomLink(request, env, admin) {
   const link = token ? await roomLinkRowFor(env, token) : null;
   if (!link) return err('link_not_found', 'No such room link.', 404);
   await env.DB.prepare('UPDATE room_links SET revoked = 1 WHERE token = ?1').bind(token).run();
+  // Gate Q3 (findings file 967): webhooks created through this link die in
+  // the same batch as the link revoke; the lazy path stays as the backstop
+  // for links that expire without an explicit revoke.
+  let webhooksRevoked = 0;
+  try {
+    const whRes = await env.DB.prepare(
+      'UPDATE room_webhooks SET revoked = 1 WHERE source_link_token = ?1 AND revoked = 0'
+    ).bind(token).run();
+    webhooksRevoked = (whRes.meta && whRes.meta.changes) || 0;
+  } catch { /* pre-031 schema: no tagged webhooks exist */ }
   const tokenPrefix = token.slice(0, 8);
   await logMod(env, 'revoke_room_link', 'room', link.room_id,
-    `label=${link.label} token_prefix=${tokenPrefix}`, 'admin:' + admin.username);
+    `label=${link.label} token_prefix=${tokenPrefix} webhooks_revoked=${webhooksRevoked}`, 'admin:' + admin.username);
   await logAdminAccess(env, admin, 'revoke_room_link', 'room', link.room_id,
     JSON.stringify({ label: link.label, expires_at: link.expires_at, token_prefix: tokenPrefix }));
   return json({ revoked: true });
