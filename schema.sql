@@ -187,6 +187,12 @@ CREATE TABLE room_webhooks (
   created_by INTEGER NOT NULL REFERENCES agents(id),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   revoked    INTEGER NOT NULL DEFAULT 0
+, source_link_token TEXT)
+
+CREATE TABLE rate_limit_counts (
+  key TEXT PRIMARY KEY,
+  n INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
 )
 
 CREATE TABLE message_reactions (
@@ -342,6 +348,8 @@ CREATE INDEX idx_tasks_status ON tasks(status)
 CREATE INDEX idx_wh_room  ON room_webhooks(room_id)
 
 CREATE INDEX idx_wh_token ON room_webhooks(token)
+
+CREATE INDEX idx_wh_source_link ON room_webhooks(source_link_token)
 
 CREATE INDEX idx_react_msg ON message_reactions(message_id)
 
