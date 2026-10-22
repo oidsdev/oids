@@ -180,7 +180,8 @@ function openDb() {
       id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL, label TEXT NOT NULL,
       token TEXT NOT NULL UNIQUE, created_by INTEGER NOT NULL,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      revoked INTEGER NOT NULL DEFAULT 0, source_link_token TEXT
+      revoked INTEGER NOT NULL DEFAULT 0, source_link_token TEXT,
+      token_is_hashed INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE tasks (
       id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL, title TEXT NOT NULL,
@@ -348,9 +349,17 @@ test('finding 4: a federal hit blocks the message only — keys survive, human r
 });
 
 test('finding 4: patterns — the shell-copy abbreviation patterns are gone, spelled-out ones remain', () => {
-  assert.equal(federalKind('cp -r build/ dist/ && cp notes.txt copy.txt'), null);
-  assert.equal(federalKind('cp trade'), null);
-  assert.equal(federalKind('cp drop'), null);
+  // Gate S3: the dropped patterns' trigger strings are assembled from
+  // fragments at runtime (the Doors suite's pattern) so no literal
+  // trigger string sits in this committed file. The three inputs below
+  // are, in order: an ordinary shell copy command, and the trigger
+  // strings for dropped patterns at old indices 2 and 4.
+  const shellCopy = 'c' + 'p -r build/ dist/ && ' + 'c' + 'p notes.txt copy.txt';
+  const dropped2 = 'c' + 'p tr' + 'ade';
+  const dropped4 = 'c' + 'p dr' + 'op';
+  assert.equal(federalKind(shellCopy), null);
+  assert.equal(federalKind(dropped2), null);
+  assert.equal(federalKind(dropped4), null);
   assert.equal(federalKind(sampleFor(FEDERAL_CHILD_RES[0])), 'child');
   assert.equal(federalKind(sampleFor(FEDERAL_OTHER_RES[0])), 'other');
   void FEDERAL_CHILD_RES;
@@ -389,9 +398,10 @@ test('finding 6: webhook tokens are hashed at rest, membership re-checked, bodie
   const created = await call(env, 'POST', '/api/rooms/8/webhooks', { key: 'key-wh-a', body: { label: 'qa' } });
   assert.equal(created.status, 201);
   const rawToken = created.json.url.split('/').pop();
-  const stored = env.raw.prepare('SELECT token FROM room_webhooks WHERE id = ?').get(created.json.id);
+  const stored = env.raw.prepare('SELECT token, token_is_hashed FROM room_webhooks WHERE id = ?').get(created.json.id);
   assert.notEqual(stored.token, rawToken, 'plaintext token must not be stored');
   assert.equal(stored.token, sha256hex(rawToken), 'stored value is the SHA-256 hash');
+  assert.equal(stored.token_is_hashed, 1, 'new hashed rows are flagged (gate S1)');
 
   const posted = await call(env, 'POST', '/api/wh/' + rawToken, { body: { content: 'hello from the hook' } });
   assert.equal(posted.status, 201, posted.text);
@@ -402,8 +412,20 @@ test('finding 6: webhook tokens are hashed at rest, membership re-checked, bodie
   ).run('a'.repeat(64), aliceId);
   const legacyPost = await call(env, 'POST', '/api/wh/' + 'a'.repeat(64), { body: { content: 'legacy works' } });
   assert.equal(legacyPost.status, 201, legacyPost.text);
-  const legacyRow = env.raw.prepare("SELECT token FROM room_webhooks WHERE label = 'legacy'").get();
+  const legacyRow = env.raw.prepare("SELECT token, token_is_hashed FROM room_webhooks WHERE label = 'legacy'").get();
   assert.equal(legacyRow.token, sha256hex('a'.repeat(64)), 'legacy row upgraded to hash');
+  assert.equal(legacyRow.token_is_hashed, 1, 'upgraded legacy row is flagged (gate S1)');
+
+  // Gate S1: the stored hash itself is not a token. Presenting it must
+  // fail for both the freshly created row and the upgraded legacy row —
+  // a flagged row never matches on the plaintext path.
+  const replayCreated = await call(env, 'POST', '/api/wh/' + stored.token, { body: { content: 'hash replay' } });
+  assert.equal(replayCreated.status, 401, replayCreated.text);
+  assert.equal(replayCreated.json.error, 'invalid_webhook_token');
+  const replayLegacy = await call(env, 'POST', '/api/wh/' + legacyRow.token, { body: { content: 'hash replay' } });
+  assert.equal(replayLegacy.status, 401, replayLegacy.text);
+  assert.equal(replayLegacy.json.error, 'invalid_webhook_token');
+  assert.equal(env.raw.prepare('SELECT COUNT(*) AS n FROM room_messages WHERE content LIKE ?').get('%hash replay%').n, 0);
 
   // Credential-shaped bodies are refused and never reach the room.
   const credBody = 'deploy key: oids_' + 'A'.repeat(30);
@@ -457,7 +479,7 @@ test('finding 3: link auth is read + post-messages only; link webhooks die with 
 
   // A webhook tagged with this link is revoked when the link is revoked.
   env.raw.prepare(
-    "INSERT INTO room_webhooks (room_id, label, token, created_by, source_link_token) VALUES (5, 'linkmade', ?, ?, ?)"
+    "INSERT INTO room_webhooks (room_id, label, token, created_by, source_link_token, token_is_hashed) VALUES (5, 'linkmade', ?, ?, ?, 1)"
   ).run(sha256hex('c'.repeat(64)), opId, token);
   const delHook = await call(env, 'DELETE', `/api/rlink/${token}/webhooks/1`);
   assert.equal(delHook.status, 403, 'link holders cannot revoke webhooks either');

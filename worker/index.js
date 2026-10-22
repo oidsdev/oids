@@ -1983,41 +1983,71 @@ async function handleTaskDelete(request, env, taskId) {
  * stored (key_hash) — a database read no longer hands out live webhook
  * URLs. Rows written before this change hold plaintext; findWebhookByToken
  * matches those on first use and upgrades them in place.
+ *
+ * Gate S1: the token_is_hashed flag (amended migration 031) marks which
+ * rows hold a hash. The hash lookup only matches flagged rows and the
+ * plaintext (raw) lookup only matches UNflagged legacy rows. Without the
+ * flag the stored hash — itself a well-formed 64-hex string — would
+ * match the raw lookup, so a database read would still hand out a
+ * working token. Once a legacy row is upgraded it is flagged, and its
+ * stored hash can never be presented as a token.
  */
 async function findWebhookByToken(env, rawToken) {
   const hash = await sha256hex(rawToken);
-  let wh = await env.DB.prepare(
-    'SELECT id, room_id, label, created_by, revoked FROM room_webhooks WHERE token = ?1'
-  ).bind(hash).first();
+  const cols = 'SELECT id, room_id, label, created_by, revoked FROM room_webhooks WHERE token = ?1';
+  let wh = null;
+  let flagged = true;
+  try {
+    wh = await env.DB.prepare(cols + ' AND token_is_hashed = 1').bind(hash).first();
+  } catch (e) {
+    // No token_is_hashed column: amended 031 has not been applied to this
+    // database (minimal test schemas). Production applies 031 before this
+    // worker deploys, so the flagged path above is the production path;
+    // the unflagged lookups below serve only the pre-031 schema.
+    if (!/token_is_hashed/.test(String((e && e.message) || e))) throw e;
+    flagged = false;
+    wh = await env.DB.prepare(cols).bind(hash).first();
+  }
   if (wh) return wh;
-  wh = await env.DB.prepare(
-    'SELECT id, room_id, label, created_by, revoked FROM room_webhooks WHERE token = ?1'
-  ).bind(rawToken).first();
+  wh = flagged
+    ? await env.DB.prepare(cols + ' AND token_is_hashed = 0').bind(rawToken).first()
+    : await env.DB.prepare(cols).bind(rawToken).first();
   if (wh) {
-    // Legacy plaintext row: upgrade to the hash in place.
+    // Legacy plaintext row: upgrade to the hash in place and flag it.
     try {
-      await env.DB.prepare('UPDATE room_webhooks SET token = ?1 WHERE id = ?2').bind(hash, wh.id).run();
+      await env.DB.prepare(
+        flagged
+          ? 'UPDATE room_webhooks SET token = ?1, token_is_hashed = 1 WHERE id = ?2'
+          : 'UPDATE room_webhooks SET token = ?1 WHERE id = ?2'
+      ).bind(hash, wh.id).run();
     } catch { /* a failed upgrade must not break the post */ }
   }
   return wh;
 }
 
-/** Insert a webhook row with the token stored hashed. source_link_token
+/** Insert a webhook row with the token stored hashed and token_is_hashed
+ *  set (gate S1: new hashed rows are always flagged). source_link_token
  *  (migration 031) tags webhooks created through a room link so they can
  *  be revoked with the link (fix pass 2, finding 3 residual); API-key
- *  creations pass null. Falls back to the pre-031 column set when the
- *  column is absent (minimal test schemas). */
+ *  creations pass null. Falls back to smaller column sets when a column
+ *  is absent (minimal test schemas). */
 async function insertWebhook(env, roomId, label, rawToken, createdBy, sourceLinkToken) {
   const tokenHash = await sha256hex(rawToken);
   const now = new Date().toISOString();
   try {
     return await env.DB.prepare(
-      'INSERT INTO room_webhooks (room_id, label, token, created_by, created_at, source_link_token) VALUES (?1, ?2, ?3, ?4, ?5, ?6)'
+      'INSERT INTO room_webhooks (room_id, label, token, created_by, created_at, source_link_token, token_is_hashed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)'
     ).bind(roomId, label, tokenHash, createdBy, now, sourceLinkToken || null).run();
   } catch {
-    return env.DB.prepare(
-      'INSERT INTO room_webhooks (room_id, label, token, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)'
-    ).bind(roomId, label, tokenHash, createdBy, now).run();
+    try {
+      return await env.DB.prepare(
+        'INSERT INTO room_webhooks (room_id, label, token, created_by, created_at, token_is_hashed) VALUES (?1, ?2, ?3, ?4, ?5, 1)'
+      ).bind(roomId, label, tokenHash, createdBy, now).run();
+    } catch {
+      return env.DB.prepare(
+        'INSERT INTO room_webhooks (room_id, label, token, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)'
+      ).bind(roomId, label, tokenHash, createdBy, now).run();
+    }
   }
 }
 

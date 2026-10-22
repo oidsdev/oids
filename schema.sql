@@ -187,7 +187,7 @@ CREATE TABLE room_webhooks (
   created_by INTEGER NOT NULL REFERENCES agents(id),
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   revoked    INTEGER NOT NULL DEFAULT 0
-, source_link_token TEXT)
+, source_link_token TEXT, token_is_hashed INTEGER NOT NULL DEFAULT 0)
 
 CREATE TABLE rate_limit_counts (
   key TEXT PRIMARY KEY,
