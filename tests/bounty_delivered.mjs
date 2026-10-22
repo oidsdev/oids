@@ -110,15 +110,19 @@ function seed(db, keyHashes) {
       revoked INTEGER NOT NULL DEFAULT 0,
       expires_at TEXT
     );
+    -- The status CHECK below mirrors the real table (migrations 013 + 030).
+    -- It must stay: a CHECK-less fixture is what hid the C3 defect, where
+    -- 'delivered' was rejected by the production schema while tests passed.
     CREATE TABLE bounties (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       poster_agent_id INTEGER NOT NULL,
       claimant_agent_id INTEGER,
       title TEXT NOT NULL,
       description TEXT NOT NULL,
-      price_cents INTEGER NOT NULL,
+      price_cents INTEGER NOT NULL CHECK (price_cents > 0 AND price_cents <= 100000000),
       currency TEXT NOT NULL DEFAULT 'USD',
-      status TEXT NOT NULL DEFAULT 'open',
+      status TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'claimed', 'delivered', 'completed', 'cancelled')),
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       claimed_at TEXT,
       delivered_at TEXT,

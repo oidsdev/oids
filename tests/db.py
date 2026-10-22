@@ -5,9 +5,12 @@ schema.sql is a D1 export dump whose statements are NOT semicolon-terminated
 special handling: strip comments, split blocks, run CREATE TABLEs first, then
 ALTERs, then everything else (indexes, triggers). Migration files are normal
 semicolon-terminated SQL, except CREATE TRIGGER ... END; blocks which are
-kept whole. Duplicate-column ALTERs (schema.sql was regenerated from the live
-DB after some migrations ran) are skipped — same as D1 would behave on a
-fresh rebuild.
+kept whole; they are applied in filename order with statement order
+preserved (a table-rebuild migration like 030 only works in its written
+order). Because schema.sql is a snapshot of the LIVE database, it already
+contains most objects the migrations create: duplicate-column ALTERs and
+already-exists CREATEs from migration files are skipped, so a fresh build
+converges on the snapshot's shape instead of dying on the overlap.
 """
 import glob
 import os
@@ -35,9 +38,20 @@ def _schema_statements():
 def _migration_statements(path):
     with open(path) as f:
         txt = "".join(re.sub(r"--.*$", "", line) for line in f)
-    trigs = re.findall(r"CREATE\s+TRIGGER.*?END\s*;", txt, re.I | re.S)
-    rest = re.sub(r"CREATE\s+TRIGGER.*?END\s*;", "", txt, flags=re.I | re.S)
-    return trigs + [s.strip() + ";" for s in rest.split(";") if s.strip()]
+    # Preserve file order; CREATE TRIGGER ... END; blocks stay atomic.
+    out, pos = [], 0
+    trig_re = re.compile(r"CREATE\s+TRIGGER.*?END\s*;", re.I | re.S)
+    while pos < len(txt):
+        m = trig_re.search(txt, pos)
+        chunk_end = m.start() if m else len(txt)
+        for s in txt[pos:chunk_end].split(";"):
+            if s.strip():
+                out.append(s.strip() + ";")
+        if not m:
+            break
+        out.append(m.group(0))
+        pos = m.end()
+    return out
 
 
 def _kind(stmt):
@@ -51,17 +65,19 @@ def _kind(stmt):
 
 def build_test_db():
     """Return an open sqlite3 connection with the full Oids schema applied."""
-    stmts = [("schema.sql", s) for s in _schema_statements()]
-    for path in sorted(glob.glob(os.path.join(OIDS_ROOT, "migrations", "*.sql"))):
-        stmts += [(os.path.basename(path), s) for s in _migration_statements(path)]
     con = sqlite3.connect(":memory:")
     cur = con.cursor()
-    for name, stmt in sorted(stmts, key=lambda ps: _kind(ps[1])):
-        try:
-            cur.execute(stmt)
-        except sqlite3.OperationalError as e:
-            if "duplicate column name" in str(e):
-                continue  # schema.sql snapshot already contains this column
-            raise AssertionError(f"{name}: {e}\n  {stmt[:100]}")
+    for stmt in sorted(_schema_statements(), key=_kind):
+        cur.execute(stmt)
+    for path in sorted(glob.glob(os.path.join(OIDS_ROOT, "migrations", "*.sql"))):
+        name = os.path.basename(path)
+        for stmt in _migration_statements(path):
+            try:
+                cur.execute(stmt)
+            except sqlite3.OperationalError as e:
+                msg = str(e)
+                if "duplicate column name" in msg or "already exists" in msg:
+                    continue  # schema.sql snapshot already contains it
+                raise AssertionError(f"{name}: {e}\n  {stmt[:100]}")
     con.commit()
     return con
