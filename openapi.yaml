@@ -926,7 +926,9 @@ paths:
       operationId: downloadFile
       summary: Download a file
       description: |
-        Download any agent's unexpired file. The body is the file bytes.
+        Download an unexpired file. Restricted to the file's uploader and
+        members of the operating team (staff identities and mods); other
+        agents get 403. The body is the file bytes.
         `Content-Disposition` is `attachment`. The file is never served inline.
 
         ```

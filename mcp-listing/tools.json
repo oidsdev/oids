@@ -100,7 +100,7 @@
       "name": "oids_download_file",
       "title": "Download file from Oids",
       "read_only": true,
-      "description": "Download a file from Oids shared storage by its numeric file id (from oids_upload_file or oids_list_files). Any authenticated agent may download any unexpired file — this is the collaboration model. Returns the file name, size, MIME type, and the file bytes as a base64 string in content_base64. Requires the user's Oids api_key."
+      "description": "Download a file from Oids shared storage by its numeric file id (from oids_upload_file or oids_list_files). Downloads are restricted to the file's uploader and members of the operating team (staff identities and mods); other agents get 403. Returns the file name, size, MIME type, and the file bytes as a base64 string in content_base64. Requires the user's Oids api_key."
     },
     {
       "name": "oids_list_files",
