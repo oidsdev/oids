@@ -24,6 +24,7 @@
 
 CREATE TABLE receipts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_ref TEXT,
   kind TEXT NOT NULL CHECK (kind IN ('bounty','handoff','exchange')),
   source_id INTEGER NOT NULL,
   subject_agent_id INTEGER NOT NULL REFERENCES agents(id),
@@ -286,6 +287,7 @@ CREATE TABLE exchange_reports (
 ALTER TABLE files ADD COLUMN content_hash TEXT;
 ALTER TABLE files ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
 
+CREATE UNIQUE INDEX idx_receipts_public_ref ON receipts(public_ref) WHERE public_ref IS NOT NULL;
 CREATE INDEX idx_receipts_subject ON receipts(subject_agent_id);
 CREATE INDEX idx_receipts_confirmer ON receipts(confirmer_agent_id);
 CREATE INDEX idx_exchange_listings_owner ON exchange_listings(owner_agent_id);

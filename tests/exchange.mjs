@@ -521,6 +521,75 @@ async function acceptance() {
     assert(auditRow && !String(auditRow.detail_json).includes('sk-roomsecret'), 'room scan rejection is logged by pattern class only');
   });
 
+  await section('C19 result-file access rule (both halves) + no integer ids in Exchange responses', async () => {
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Design review' });
+    const fileId = seedFile(w, 2, 'r2-c19-result', 'Findings are attached here.', 'text/plain', 'result.txt');
+    const req = await fileRequest(w, 'borrower_bot', listing.ref);
+    const { grant } = await approveAndGrant(w, 'owner_bot', listing.human, req.ref, { performer: 'grantee' });
+    const done = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.borrower_bot, body: { result_file_id: fileId } });
+    assert(done.status === 200, 'performer attaches own result file, got ' + done.status + ' ' + done.text);
+    // Half (b): the defined party rule - recipients (non-performer principals)
+    // and the performer who recorded completion may read the result.
+    const asRecipient = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, { key: KEY.owner_bot });
+    assert(asRecipient.status === 200, 'recipient party downloads the result (D3 rule)');
+    const asPerformer = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, { key: KEY.borrower_bot });
+    assert(asPerformer.status === 200, 'the performer who recorded completion downloads the result');
+    // Half (a): everyone else fails, including other admitted pilot agents
+    // and a channel member who is not a party to this grant.
+    const ch = await channelSetup(w);
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.third_bot, body: {} });
+    const asChannelPeer = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, { key: KEY.third_bot });
+    assert(asChannelPeer.status === 404, 'channel peer who is not a grant party cannot download, got ' + asChannelPeer.status);
+    const asOutsider = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, { key: KEY.coord_bot });
+    assert(asOutsider.status === 404, 'non-party download fails (C19 half a)');
+    const asAnon = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, {});
+    assert(asAnon.status === 401 || asAnon.status === 404, 'anonymous download fails');
+    // No integer ids in Exchange responses (folded section 13 ruling):
+    // objects are addressed and returned by public_ref only.
+    const listingJson = JSON.stringify(listing);
+    assert(!/"id":\d/.test(listingJson), 'listing response carries no integer id');
+    const grantJson = JSON.stringify(done.json.grant);
+    assert(!/"id":\d/.test(grantJson), 'grant response carries no integer id');
+    const chView = await w.call('GET', `/api/v1/exchange/channels/${ch.ref}`, { key: KEY.owner_bot });
+    assert(!/"id":\d/.test(JSON.stringify(chView.json.channel)), 'channel response carries no integer id');
+    const audit = await w.call('GET', `/api/v1/exchange/objects/grant/${grant.ref}/audit`, { key: KEY.owner_bot });
+    assert(audit.status === 200 && !/"id":\d/.test(JSON.stringify(audit.json)), 'audit response carries no integer ids, got ' + audit.status);
+  });
+
+  await section('DROP-1 receipts authorize nothing (legal drop list item 1)', async () => {
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Audit pass' });
+    const fileId = seedFile(w, 2, 'r2-drop1-result', 'Delivered findings.', 'text/plain', 'out.txt');
+    const req = await fileRequest(w, 'borrower_bot', listing.ref);
+    const { grant } = await approveAndGrant(w, 'owner_bot', listing.human, req.ref, { performer: 'grantee' });
+    await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.borrower_bot, body: { result_file_id: fileId } });
+    const conf = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/confirm`, { key: KEY.owner_bot, body: {} });
+    assert(conf.status === 200 && conf.json.receipt && conf.json.receipt.ref, 'a receipt now exists for the confirmed grant');
+    const receiptRef = conf.json.receipt.ref;
+    // The receipt is not an address or a credential for anything.
+    const byReceiptRef = await w.call('GET', `/api/v1/exchange/grants/${receiptRef}`, { key: KEY.owner_bot });
+    assert(byReceiptRef.status === 404, 'a receipt ref does not resolve to the grant');
+    // A second grant between different parties: the first receipt's
+    // confirmer gains nothing from holding it.
+    const listing2 = await makeLiveListing(w, 'third_bot', { title: 'Separate job' });
+    const file2 = seedFile(w, 4, 'r2-drop1-other', 'Other work product.', 'text/plain', 'other.txt');
+    const req2 = await fileRequest(w, 'fourth_bot', listing2.ref);
+    const g2 = await approveAndGrant(w, 'third_bot', listing2.human, req2.ref, { performer: 'grantee' });
+    await w.call('POST', `/api/v1/exchange/grants/${g2.grant.ref}/done`, { key: KEY.fourth_bot, body: { result_file_id: file2 } });
+    const cross = await w.call('GET', `/api/v1/exchange/grants/${g2.grant.ref}/result`, { key: KEY.owner_bot });
+    assert(cross.status === 404, 'holding an unrelated receipt confers no download access');
+    const crossView = await w.call('GET', `/api/v1/exchange/grants/${g2.grant.ref}`, { key: KEY.owner_bot });
+    assert(crossView.status === 404, 'holding an unrelated receipt confers no grant read access');
+    // Recording share consent on a receipt changes receipt visibility
+    // only; it does not widen grant or file access.
+    const ch = await channelSetup(w);
+    const consent = await w.call('POST', `/api/v1/exchange/receipts/${receiptRef}/share-consent`, { key: KEY.owner_bot, body: { channel_ref: ch.ref } });
+    assert(consent.status === 200, 'share consent records');
+    const stillClosed = await w.call('GET', `/api/v1/exchange/grants/${grant.ref}/result`, { key: KEY.third_bot });
+    assert(stillClosed.status === 404, 'receipt sharing never widens result-file access');
+  });
+
   await section('T19/C16-C21 copy scan of shipped Exchange strings', async () => {
     const src = readFileSync(new URL('../worker/index.js', import.meta.url), 'utf8');
     const block = src.slice(src.indexOf('// ===== EXCHANGE BEGIN ====='), src.indexOf('// ===== EXCHANGE END ====='));
@@ -914,12 +983,12 @@ async function fixtures() {
     const doneB = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.borrower_bot, body: {} });
     assert(doneB.status === 200, 'a current set member still in the room can act');
     await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/confirm`, { key: KEY.owner_bot, body: {} });
-    const receiptRow = sqlOne(w, "SELECT id FROM receipts WHERE kind = 'exchange'");
+    const receiptRow = sqlOne(w, "SELECT public_ref AS r FROM receipts WHERE kind = 'exchange'");
     const observerBefore = await w.call('GET', '/api/v1/exchange/receipts/summary?agent=borrower_bot', { key: KEY.late_bot });
     assert(observerBefore.json.summary.total === 0, 'observer cannot see the receipt before any sharing');
     await w.call('PATCH', `/api/v1/exchange/channels/${ch.ref}`, { key: KEY.owner_bot, body: { receipts_visible: true } });
-    await w.call('POST', `/api/v1/exchange/receipts/${receiptRow.id}/share-consent`, { key: KEY.borrower_bot, body: { channel_ref: ch.ref } });
-    await w.call('POST', `/api/v1/exchange/receipts/${receiptRow.id}/share-consent`, { key: KEY.owner_bot, body: { channel_ref: ch.ref } });
+    await w.call('POST', `/api/v1/exchange/receipts/${receiptRow.r}/share-consent`, { key: KEY.borrower_bot, body: { channel_ref: ch.ref } });
+    await w.call('POST', `/api/v1/exchange/receipts/${receiptRow.r}/share-consent`, { key: KEY.owner_bot, body: { channel_ref: ch.ref } });
     const observerAfter = await w.call('GET', '/api/v1/exchange/receipts/summary?agent=borrower_bot', { key: KEY.late_bot });
     assert(observerAfter.json.summary.total === 0, 'the admin toggle + consent never expose a receipt from before the change (prospective only)');
   });

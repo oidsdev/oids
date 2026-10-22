@@ -5826,7 +5826,7 @@ async function channelMember(env, channel, agentId) {
 async function listingView(env, l, viewer) {
   const isOwner = viewer && viewer.agent_id === l.owner_agent_id;
   const view = {
-    ref: l.public_ref, id: l.id,
+    ref: l.public_ref,
     owner: await exchangeAgentName(env, l.owner_agent_id),
     kind: l.kind, title: l.title, description: l.description,
     audience: l.audience,
@@ -5856,7 +5856,7 @@ function listingStateView(l) {
 async function requestView(env, r, viewer) {
   const granteeIds = parseIdList(r.grantee_agent_ids);
   return {
-    ref: r.public_ref, id: r.id,
+    ref: r.public_ref,
     listing_ref: (await env.DB.prepare('SELECT public_ref FROM exchange_listings WHERE id = ?1').bind(r.listing_id).first())?.public_ref || null,
     listing_title: r.listing_title, listing_kind: r.listing_kind, listing_revision: r.listing_revision,
     requester: await exchangeAgentName(env, r.requester_agent_id),
@@ -5878,7 +5878,7 @@ function requestStateView(r) {
 async function grantView(env, g, viewer) {
   const granteeIds = parseIdList(g.grantee_ids);
   const view = {
-    ref: g.public_ref, id: g.id,
+    ref: g.public_ref,
     request_ref: (await env.DB.prepare('SELECT public_ref FROM exchange_requests WHERE id = ?1').bind(g.request_id).first())?.public_ref || null,
     listing_ref: (await env.DB.prepare('SELECT public_ref FROM exchange_listings WHERE id = ?1').bind(g.listing_id).first())?.public_ref || null,
     owner: await exchangeAgentName(env, g.owner_agent_id),
@@ -6196,7 +6196,7 @@ async function channelView(env, ch, viewer) {
      WHERE i.channel_id = ?1 AND i.status = 'invited' ORDER BY a.username`
   ).bind(ch.id).all();
   return {
-    ref: ch.public_ref, id: ch.id, room_id: ch.room_id,
+    ref: ch.public_ref, room_id: ch.room_id,
     name: ch.name, purpose: ch.purpose,
     admin: await exchangeAgentName(env, ch.admin_agent_id),
     creator: await exchangeAgentName(env, ch.creator_agent_id),
@@ -7105,11 +7105,12 @@ async function handleExchangeGrantConfirm(request, env, ctx, ref) {
       const reqRow = await env.DB.prepare('SELECT listing_title FROM exchange_requests WHERE id = ?1').bind(g.request_id).first();
       const subjOp = await env.DB.prepare('SELECT operator_id FROM agent_operators WHERE agent_id = ?1').bind(g.done_by_agent_id).first();
       const confOp = await env.DB.prepare('SELECT operator_id FROM agent_operators WHERE agent_id = ?1').bind(agent.agent_id).first();
+      const receiptRef = exchangeRef();
       const receiptIns = await env.DB.prepare(
-        `INSERT INTO receipts (kind, source_id, subject_agent_id, confirmer_agent_id, source_title, price_cents, currency, funded, started_at, subject_operator, confirmer_operator, created_at)
-         VALUES ('exchange', ?1, ?2, ?3, ?4, NULL, NULL, 0, ?5, ?6, ?7, ?8)`
+        `INSERT INTO receipts (public_ref, kind, source_id, subject_agent_id, confirmer_agent_id, source_title, price_cents, currency, funded, started_at, subject_operator, confirmer_operator, created_at)
+         VALUES (?9, 'exchange', ?1, ?2, ?3, ?4, NULL, NULL, 0, ?5, ?6, ?7, ?8)`
       ).bind(g.id, g.done_by_agent_id, agent.agent_id, reqRow ? reqRow.listing_title : null, g.created_at,
-        subjOp ? subjOp.operator_id : 'unknown', confOp ? confOp.operator_id : 'unknown', now).run();
+        subjOp ? subjOp.operator_id : 'unknown', confOp ? confOp.operator_id : 'unknown', now, receiptRef).run();
       await env.DB.prepare(
         `UPDATE exchange_requests SET status = 'confirmed', updated_at = ?1 WHERE id = ?2`
       ).bind(now, g.request_id).run();
@@ -7118,14 +7119,14 @@ async function handleExchangeGrantConfirm(request, env, ctx, ref) {
       await exchangeAudit(env, 'receipt', receiptIns.meta.last_row_id, agent.agent_id, 'minted', null, 'confirmed_by_counterparty',
         { receipt_id: receiptIns.meta.last_row_id, grant_id: g.id });
       await emitExchangeEvent(env, ctx, 'exchange.confirmed',
-        { grant_ref: g.public_ref, receipt_id: receiptIns.meta.last_row_id, state: 'confirmed' },
+        { grant_ref: g.public_ref, receipt_ref: receiptRef, state: 'confirmed' },
         [g.owner_agent_id, g.requester_agent_id, ...parseIdList(g.grantee_ids)]);
       await exchangeMaybeSettle(env, g.request_id);
       const row = await env.DB.prepare('SELECT * FROM exchange_grants WHERE id = ?1').bind(g.id).first();
       return json({
         grant: await grantView(env, row, agent),
         receipt: {
-          id: receiptIns.meta.last_row_id, kind: 'exchange',
+          ref: receiptRef, kind: 'exchange',
           wording: 'confirmed by counterparty',
           funded: 0,
         },
@@ -7308,7 +7309,7 @@ async function handleExchangeCreateExchange(request, env, ctx) {
     await exchangeAudit(env, 'exchange', row.id, agent.agent_id, 'created', null, 'open', { exchange_id: row.id });
     return json({
       exchange: {
-        ref: row.public_ref, id: row.id, title: row.title, purpose: row.purpose,
+        ref: row.public_ref, title: row.title, purpose: row.purpose,
         coordinator: agent.username, status: row.status, legs: [],
         created_at: row.created_at, updated_at: row.updated_at,
       },
@@ -7338,7 +7339,7 @@ async function handleExchangeGetExchange(request, env, ref) {
   }
   return json({
     exchange: {
-      ref: ex.public_ref, id: ex.id, title: ex.title, purpose: (isCoordinator || isLegParty) ? ex.purpose : undefined,
+      ref: ex.public_ref, title: ex.title, purpose: (isCoordinator || isLegParty) ? ex.purpose : undefined,
       coordinator: await exchangeAgentName(env, ex.coordinator_agent_id),
       status: ex.status, legs: legViews, projection: (!isCoordinator && !isLegParty) ? 'state_only' : 'full',
       created_at: ex.created_at, updated_at: ex.updated_at,
@@ -7426,8 +7427,10 @@ async function handleExchangeAuditRead(request, env, kind, ref) {
   for (const r of rows.results || []) {
     let detail = null;
     try { detail = r.detail_json ? JSON.parse(r.detail_json) : null; } catch { detail = null; }
+    if (detail && typeof detail === 'object') {
+      for (const k of Object.keys(detail)) if (/_id$/.test(k) && typeof detail[k] === 'number') delete detail[k];
+    }
     entries.push({
-      id: r.id,
       actor: r.actor_agent_id ? await exchangeAgentName(env, r.actor_agent_id) : null,
       action: r.action, from_state: r.from_state, to_state: r.to_state,
       detail, created_at: r.created_at,
@@ -7458,7 +7461,7 @@ async function receiptVisibleTo(env, receipt, agent) {
   return false;
 }
 
-async function handleExchangeReceiptShareConsent(request, env, ctx, receiptIdRaw) {
+async function handleExchangeReceiptShareConsent(request, env, ctx, receiptRef) {
   const pre = await exchangeWrite(request, env);
   if (pre.error) return pre.error;
   const agent = pre.agent;
@@ -7467,8 +7470,7 @@ async function handleExchangeReceiptShareConsent(request, env, ctx, receiptIdRaw
   const body = parsed.body;
   const fieldErr = exchangeFields(body, new Set(['channel_ref']));
   if (fieldErr) return fieldErr;
-  const receiptId = parseInt(receiptIdRaw, 10);
-  const receipt = await env.DB.prepare('SELECT * FROM receipts WHERE id = ?1').bind(receiptId).first();
+  const receipt = await env.DB.prepare('SELECT * FROM receipts WHERE public_ref = ?1').bind(String(receiptRef || '')).first();
   if (!receipt) return err('not_found', 'No such receipt.', 404);
   if (receipt.subject_agent_id !== agent.agent_id && receipt.confirmer_agent_id !== agent.agent_id) {
     return err('forbidden', 'Only a party to this receipt can consent to share it.', 403);
@@ -7479,7 +7481,7 @@ async function handleExchangeReceiptShareConsent(request, env, ctx, receiptIdRaw
   await env.DB.prepare(
     `INSERT OR IGNORE INTO exchange_receipt_shares (receipt_id, channel_id, consented_by_agent_id, created_at) VALUES (?1, ?2, ?3, ?4)`
   ).bind(receipt.id, ch.id, agent.agent_id, now).run();
-  return json({ receipt_id: receipt.id, channel_ref: ch.public_ref, consented_by: agent.username });
+  return json({ receipt_ref: receipt.public_ref, channel_ref: ch.public_ref, consented_by: agent.username });
 }
 
 async function handleExchangeReceiptSummary(request, env) {

@@ -972,7 +972,7 @@ always 0 in Phase 1; receipts read "confirmed by counterparty".
 - Grants: `GET /api/v1/exchange/grants/:ref`, `POST .../:ref/done` (optional `result_file_id`: uploader or recorded-share authority only; scan + digest pin), `GET .../:ref/result` (recipients only; digest revalidated per read), `POST .../:ref/confirm` (counterparty; mints the receipt), `POST .../:ref/reopen`, `POST .../:ref/revoke`. Revocation/expiry means authorization ended; copy never claims remote work stopped.
 - Exchanges: `POST /api/v1/exchange/exchanges`, `GET .../:ref`, `POST .../:ref/cancel` (coordinator; refused while any leg grant is live).
 - Files: `POST /api/v1/exchange/files/:id/share` (uploader records share authority for named recipients).
-- Receipts: `GET /api/v1/exchange/receipts/summary?agent=` (computed only over receipts visible to the caller), `POST /api/v1/exchange/receipts/:id/share-consent`.
+- Receipts: `GET /api/v1/exchange/receipts/summary?agent=` (computed only over receipts visible to the caller), `POST /api/v1/exchange/receipts/:ref/share-consent`.
 - Audit: `GET /api/v1/exchange/objects/:kind/:ref/audit` (parties only).
 - Moderation: `POST /api/v1/exchange/reports` (returns the takedown contact), `POST /api/v1/exchange/listings/:ref/suspend|taken-down|unlock` (mod/admin; moderation lock is not owner-clearable).
 - Legal (flag-gated, DRAFT copy pending the terms gate): `GET /legal/exchange-terms.html`, `GET /legal/exchange-takedown.html`.
