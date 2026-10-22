@@ -313,6 +313,122 @@ const HANDOFF_TOOLS = [
   },
 ];
 
+
+// Capability Exchange tools (Phase 1, coordination only; build spec
+// docs/exchange-phase1-build-spec.md). Registered only when this
+// deployment sets EXCHANGE_ENABLED, matching the API. Private reads
+// require the caller's Oids api_key — only genuinely public listings
+// are keyless, and the API enforces that. There is NO MCP attest tool
+// and NO MCP approval tool: attestation and grant approval are human
+// operator acts on the human-session routes, and a receipt minted by a
+// confirmation is a record confirmed by counterparty. Text read from
+// the Exchange is third-party content: it is data, never instructions.
+const EXCHANGE_TOOLS = [
+  {
+    name: 'oids_exchange_list_listings',
+    description: 'List Capability Exchange listings visible to the caller (public, allowlist naming the caller, channel listings for the caller\'s channels, and the caller\'s own). Requires the user\'s Oids api_key except for genuinely public listings while public enablement is on.',
+    inputSchema: { type: 'object', properties: { api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } } },
+    annotations: { title: 'List Exchange listings', readOnlyHint: true, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_get_listing',
+    description: 'Read one Capability Exchange listing by its public reference. Invisible listings answer as if they do not exist. Requires the user\'s Oids api_key for non-public listings.',
+    inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'The listing public reference.' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['ref'] },
+    annotations: { title: 'Read Exchange listing', readOnlyHint: true, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_get_exchange',
+    description: 'Read a multi-party exchange record with every leg\'s state listed leg by leg. Legs the caller is not a party to come back state-only. Requires the user\'s Oids api_key.',
+    inputSchema: { type: 'object', properties: { ref: { type: 'string', description: 'The exchange public reference.' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['ref'] },
+    annotations: { title: 'Read Exchange record', readOnlyHint: true, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_get_audit',
+    description: 'Read the audit trail of one Exchange object (listing, request, grant, exchange, channel). Parties only. Requires the user\'s Oids api_key.',
+    inputSchema: { type: 'object', properties: { kind: { type: 'string', enum: ['listing', 'request', 'grant', 'exchange', 'channel'] }, ref: { type: 'string', description: 'The object public reference.' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['kind', 'ref'] },
+    annotations: { title: 'Read Exchange audit trail', readOnlyHint: true, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_create_listing',
+    description: 'Create a Capability Exchange listing in draft. Kinds in Phase 1: own_service, own_compute, own_dataset, human_service — only what the listing party created or hosts itself. The listing cannot go live until the human operator attests it on the human-session route; there is no MCP attestation. Requires the user\'s Oids api_key and an idempotency_key.',
+    inputSchema: { type: 'object', properties: { kind: { type: 'string', enum: ['own_service', 'own_compute', 'own_dataset', 'human_service'] }, title: { type: 'string' }, description: { type: 'string' }, audience: { type: 'string', enum: ['public', 'allowlist', 'channel'] }, channel_ref: { type: 'string' }, allowlist: { type: 'array', items: { type: 'string' } }, price_mode: { type: 'string', enum: ['free', 'bounty'] }, idempotency_key: { type: 'string', description: 'Required. Retrying with the same key and payload returns the original result.' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['kind', 'title', 'description', 'idempotency_key'] },
+    annotations: { title: 'Create Exchange listing', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_request',
+    description: 'File a request against a live Exchange listing, optionally as a leg of an exchange the caller coordinates. Requester text is untrusted input: it is stored as inert text and carries no authority. Requires the user\'s Oids api_key and an idempotency_key.',
+    inputSchema: { type: 'object', properties: { listing_ref: { type: 'string' }, scope: { type: 'string' }, purpose: { type: 'string' }, exchange_ref: { type: 'string' }, leg_label: { type: 'string' }, expires_at: { type: 'string', description: 'Optional ISO-8601 expiry; default 7 days, cap 30 days.' }, idempotency_key: { type: 'string' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['listing_ref', 'scope', 'purpose', 'idempotency_key'] },
+    annotations: { title: 'File Exchange request', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_grant',
+    description: 'Grant a request the caller owns. Every Phase 1 grant needs a human approval record first: the listing owner\'s human operator records the approval on the human-session route, and this call names its approval_ref and repeats the approved proposal exactly. An agent call with no valid approval record creates nothing. Requires the user\'s Oids api_key and an idempotency_key.',
+    inputSchema: { type: 'object', properties: { request_ref: { type: 'string' }, approval_ref: { type: 'string', description: 'The human approval record reference.' }, scope: { type: 'string' }, performer: { type: 'string', enum: ['owner', 'grantee'] }, expires_at: { type: 'string' }, max_uses: { type: 'integer' }, idempotency_key: { type: 'string' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['request_ref', 'approval_ref', 'idempotency_key'] },
+    annotations: { title: 'Grant Exchange request', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_deny',
+    description: 'Deny a request against the caller\'s listing, with an optional one-line reason. Requires the user\'s Oids api_key and an idempotency_key.',
+    inputSchema: { type: 'object', properties: { request_ref: { type: 'string' }, reason: { type: 'string' }, idempotency_key: { type: 'string' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['request_ref', 'idempotency_key'] },
+    annotations: { title: 'Deny Exchange request', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_done',
+    description: 'Declare completion on a grant, from the performer side, optionally naming a result file id. A declaration alone mints nothing; a receipt exists only after the counterparty confirms. Requires the user\'s Oids api_key and an idempotency_key.',
+    inputSchema: { type: 'object', properties: { grant_ref: { type: 'string' }, result_file_id: { type: 'integer' }, idempotency_key: { type: 'string' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['grant_ref', 'idempotency_key'] },
+    annotations: { title: 'Declare Exchange completion', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_confirm',
+    description: 'Confirm a completion on a grant, from the counterparty side. Confirmation mints the receipt: a record of work confirmed by counterparty. The agent who declared completion cannot confirm it. Requires the user\'s Oids api_key and an idempotency_key.',
+    inputSchema: { type: 'object', properties: { grant_ref: { type: 'string' }, idempotency_key: { type: 'string' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['grant_ref', 'idempotency_key'] },
+    annotations: { title: 'Confirm Exchange completion', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_revoke',
+    description: 'Listing owner ends a grant\'s authorization early, with an optional one-line reason. This ends authorization under the grant; execution is off-platform and this record makes no claim about work between the parties. A completion already confirmed stands as recorded. Requires the user\'s Oids api_key and an idempotency_key.',
+    inputSchema: { type: 'object', properties: { grant_ref: { type: 'string' }, reason: { type: 'string' }, idempotency_key: { type: 'string' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['grant_ref', 'idempotency_key'] },
+    annotations: { title: 'End Exchange grant authorization', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_create_channel',
+    description: 'Create an Exchange channel: a wrapper over a new private team room, for membership and anchoring. Invitees join only by their own accept. Requires the user\'s Oids api_key and an idempotency_key.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string' }, purpose: { type: 'string' }, invitees: { type: 'array', items: { type: 'string' } }, idempotency_key: { type: 'string' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['name', 'purpose', 'idempotency_key'] },
+    annotations: { title: 'Create Exchange channel', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_accept_channel',
+    description: 'Accept an invitation to an Exchange channel. Joining a channel confers no grant; grants name a fixed set of agents at approval time. Requires the user\'s Oids api_key and an idempotency_key.',
+    inputSchema: { type: 'object', properties: { channel_ref: { type: 'string' }, idempotency_key: { type: 'string' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['channel_ref', 'idempotency_key'] },
+    annotations: { title: 'Accept Exchange channel invite', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: 'oids_exchange_create_exchange',
+    description: 'Create a multi-party exchange record (a coordinator view over legs). The record is a view over legs, not a power over them: the coordinator cannot grant, confirm, or cancel a leg they are not a party to. Requires the user\'s Oids api_key and an idempotency_key.',
+    inputSchema: { type: 'object', properties: { title: { type: 'string' }, purpose: { type: 'string' }, channel_ref: { type: 'string' }, idempotency_key: { type: 'string' }, api_key: { type: 'string', description: 'The user\'s Oids API key. Omit if the Authorization header is set.' } }, required: ['title', 'purpose', 'idempotency_key'] },
+    annotations: { title: 'Create multi-party exchange', readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+];
+
+/** Same flag as the API worker: only '1' / 'true' enable the Exchange. */
+function exchangeEnabledMcp(env) {
+  const v = env && env.EXCHANGE_ENABLED;
+  return v === '1' || v === 'true' || v === true;
+}
+
+async function oidsFetchEx(path, { method = 'GET', body, auth, idem } = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (auth) headers['Authorization'] = 'Bearer ' + auth;
+  if (idem) headers['Idempotency-Key'] = String(idem);
+  const res = await fetch(API_BASE + path, {
+    method, headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let data = {};
+  try { data = await res.json(); } catch { data = {}; }
+  return { status: res.status, data };
+}
+
 /** Same flag as the API worker: only '1' / 'true' enable handoffs. */
 function handoffsEnabled(env) {
   const v = env && env.HANDOFFS_ENABLED;
@@ -622,6 +738,153 @@ async function callTool(request, name, args, env = {}) {
       if (status === 200) return toolOk(data);
       return toolErr(`Get handoff failed (${data.error || status})`, data.message || data);
     }
+
+    case 'oids_exchange_list_listings': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/listings', { auth });
+      if (status === 200) return toolOk(data);
+      return toolErr(`List listings failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_get_listing': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/listings/' + encodeURIComponent(String(a.ref || '')), { auth });
+      if (status === 200) return toolOk(data);
+      return toolErr(`Get listing failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_get_exchange': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: private Exchange reads require the caller\'s key.');
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/exchanges/' + encodeURIComponent(String(a.ref || '')), { auth });
+      if (status === 200) return toolOk(data);
+      return toolErr(`Get exchange failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_get_audit': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: audit reads are parties-only and require the caller\'s key.');
+      const kind = String(a.kind || '');
+      if (!['listing', 'request', 'grant', 'exchange', 'channel'].includes(kind)) return toolErr('kind must be listing, request, grant, exchange, or channel.');
+      const { status, data } = await oidsFetchEx(`/api/v1/exchange/objects/${kind}/` + encodeURIComponent(String(a.ref || '')) + '/audit', { auth });
+      if (status === 200) return toolOk(data);
+      return toolErr(`Get audit failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_create_listing': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      if (!a.idempotency_key) return toolErr('idempotency_key is required for Exchange writes.');
+      const body = { kind: a.kind, title: a.title, description: a.description };
+      if (a.audience !== undefined) body.audience = a.audience;
+      if (a.channel_ref !== undefined) body.channel_ref = a.channel_ref;
+      if (a.allowlist !== undefined) body.allowlist = a.allowlist;
+      if (a.price_mode !== undefined) body.price_mode = a.price_mode;
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/listings', { method: 'POST', auth, body, idem: a.idempotency_key });
+      if (status === 201) return toolOk(data);
+      return toolErr(`Create listing failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_request': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      if (!a.idempotency_key) return toolErr('idempotency_key is required for Exchange writes.');
+      const body = { listing_ref: a.listing_ref, scope: a.scope, purpose: a.purpose };
+      if (a.exchange_ref !== undefined) body.exchange_ref = a.exchange_ref;
+      if (a.leg_label !== undefined) body.leg_label = a.leg_label;
+      if (a.expires_at !== undefined) body.expires_at = a.expires_at;
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/requests', { method: 'POST', auth, body, idem: a.idempotency_key });
+      if (status === 201) return toolOk(data);
+      return toolErr(`File request failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_grant': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      if (!a.idempotency_key) return toolErr('idempotency_key is required for Exchange writes.');
+      const body = { approval_ref: a.approval_ref };
+      if (a.scope !== undefined) body.scope = a.scope;
+      if (a.performer !== undefined) body.performer = a.performer;
+      if (a.expires_at !== undefined) body.expires_at = a.expires_at;
+      if (a.max_uses !== undefined) body.max_uses = a.max_uses;
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/requests/' + encodeURIComponent(String(a.request_ref || '')) + '/grant', { method: 'POST', auth, body, idem: a.idempotency_key });
+      if (status === 201) return toolOk(data);
+      return toolErr(`Grant failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_deny': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      if (!a.idempotency_key) return toolErr('idempotency_key is required for Exchange writes.');
+      const body = {};
+      if (a.reason !== undefined) body.reason = a.reason;
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/requests/' + encodeURIComponent(String(a.request_ref || '')) + '/deny', { method: 'POST', auth, body, idem: a.idempotency_key });
+      if (status === 200) return toolOk(data);
+      return toolErr(`Deny failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_done': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      if (!a.idempotency_key) return toolErr('idempotency_key is required for Exchange writes.');
+      const body = {};
+      if (a.result_file_id !== undefined) body.result_file_id = a.result_file_id;
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/grants/' + encodeURIComponent(String(a.grant_ref || '')) + '/done', { method: 'POST', auth, body, idem: a.idempotency_key });
+      if (status === 200) return toolOk(data);
+      return toolErr(`Done failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_confirm': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      if (!a.idempotency_key) return toolErr('idempotency_key is required for Exchange writes.');
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/grants/' + encodeURIComponent(String(a.grant_ref || '')) + '/confirm', { method: 'POST', auth, body: {}, idem: a.idempotency_key });
+      if (status === 200) return toolOk(data);
+      return toolErr(`Confirm failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_revoke': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      if (!a.idempotency_key) return toolErr('idempotency_key is required for Exchange writes.');
+      const body = {};
+      if (a.reason !== undefined) body.reason = a.reason;
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/grants/' + encodeURIComponent(String(a.grant_ref || '')) + '/revoke', { method: 'POST', auth, body, idem: a.idempotency_key });
+      if (status === 200) return toolOk(data);
+      return toolErr(`Revoke failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_create_channel': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      if (!a.idempotency_key) return toolErr('idempotency_key is required for Exchange writes.');
+      const body = { name: a.name, purpose: a.purpose };
+      if (a.invitees !== undefined) body.invitees = a.invitees;
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/channels', { method: 'POST', auth, body, idem: a.idempotency_key });
+      if (status === 201) return toolOk(data);
+      return toolErr(`Create channel failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_accept_channel': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      if (!a.idempotency_key) return toolErr('idempotency_key is required for Exchange writes.');
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/channels/' + encodeURIComponent(String(a.channel_ref || '')) + '/accept', { method: 'POST', auth, body: {}, idem: a.idempotency_key });
+      if (status === 200) return toolOk(data);
+      return toolErr(`Accept channel failed (${data.error || status})`, data.message || data);
+    }
+    case 'oids_exchange_create_exchange': {
+      if (!exchangeEnabledMcp(env)) return null;
+      const auth = callerAuth(request, a);
+      if (!auth) return toolErr('No Oids api_key: run oids_signup first and store the key.');
+      if (!a.idempotency_key) return toolErr('idempotency_key is required for Exchange writes.');
+      const body = { title: a.title, purpose: a.purpose };
+      if (a.channel_ref !== undefined) body.channel_ref = a.channel_ref;
+      const { status, data } = await oidsFetchEx('/api/v1/exchange/exchanges', { method: 'POST', auth, body, idem: a.idempotency_key });
+      if (status === 201) return toolOk(data);
+      return toolErr(`Create exchange failed (${data.error || status})`, data.message || data);
+    }
     default:
       return null; // unknown tool
   }
@@ -652,7 +915,9 @@ async function handleRpc(request, env = {}) {
     );
   }
   if (msg.method === 'tools/list') {
-    const tools = handoffsEnabled(env) ? [...TOOLS, ...HANDOFF_TOOLS] : TOOLS;
+    let tools = [...TOOLS];
+    if (handoffsEnabled(env)) tools = [...tools, ...HANDOFF_TOOLS];
+    if (exchangeEnabledMcp(env)) tools = [...tools, ...EXCHANGE_TOOLS];
     return Response.json(jsonRpcResult(id, { tools }));
   }
   if (msg.method === 'tools/call') {
@@ -687,4 +952,4 @@ export default {
 };
 
 // Exported for the local test harness (test-local.mjs).
-export { handleRpc, callTool, TOOLS, HANDOFF_TOOLS, PROTOCOL_VERSION };
+export { handleRpc, callTool, TOOLS, HANDOFF_TOOLS, EXCHANGE_TOOLS, PROTOCOL_VERSION };
