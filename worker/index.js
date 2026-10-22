@@ -5030,6 +5030,209 @@ async function handleAdminSetReadOnly(request, env, admin) {
 }
 
 // ---------------------------------------------------------------------------
+// Admin room share links (Desk Chat). Room links are no-login credentials
+// (see the room-link consumers above); until now every mint was a hand-run
+// D1 insert. These routes are the audited API for the link lifecycle:
+//   POST /api/admin/room-links          → mint (full token shown ONCE, here)
+//   POST /api/admin/room-links/extend   → new expiry from now (revives expired)
+//   POST /api/admin/room-links/revoke   → revoke (never resurrected by extend)
+//   GET  /api/admin/room-links          → list (token_prefix only, never full)
+// Mint/extend/revoke are credential-creating writes: each writes BOTH a
+// moderation_log entry (logMod) and an admin_access_log row (logAdminAccess,
+// prefix-only detail). List is a metadata read: admin_access_log only. The
+// full token is never written to either log.
+// ---------------------------------------------------------------------------
+
+/** ttl_days for mint/extend: optional, default 7, integer 1..30.
+ *  Fractional or non-numeric values are rejected, never rounded. */
+function parseRoomLinkTtl(body) {
+  if (body.ttl_days === undefined || body.ttl_days === null) return { value: 7 };
+  const t = body.ttl_days;
+  if (typeof t !== 'number' || !Number.isInteger(t) || t < 1 || t > 30) {
+    return { error: err('invalid_ttl', 'ttl_days must be an integer between 1 and 30.', 400) };
+  }
+  return { value: t };
+}
+
+/** label for mint: optional string, trimmed, max 120 chars, default "". */
+function parseRoomLinkLabel(body) {
+  if (body.label === undefined || body.label === null) return { value: '' };
+  if (typeof body.label !== 'string') {
+    return { error: err('invalid_label', 'label must be a string of 120 characters or fewer.', 400) };
+  }
+  const value = body.label.trim();
+  if (contentLength(value) > 120) {
+    return { error: err('invalid_label', 'label must be 120 characters or fewer.', 400) };
+  }
+  return { value };
+}
+
+/** Full room-link row (with room name + label) for extend/revoke lookups. */
+async function roomLinkRowFor(env, token) {
+  return env.DB.prepare(
+    `SELECT l.token AS token, l.room_id AS room_id, l.label AS label, l.revoked AS revoked,
+            l.created_at AS created_at, l.expires_at AS expires_at, r.name AS room_name
+     FROM room_links l JOIN rooms r ON r.id = l.room_id
+     WHERE l.token = ?1`
+  ).bind(token).first();
+}
+
+/** POST /api/admin/room-links {"room_id": 1, "label": "...", "ttl_days": 7} (admin).
+ *  Mints a 64-hex room link. The full token is returned only in this response
+ *  (and in the extend response); everywhere else it is prefix-only. */
+async function handleAdminMintRoomLink(request, env, admin) {
+  // Defense in depth (audit M16): do not rely on the router gate alone.
+  if (!admin || admin.username !== ADMIN_USERNAME) return err('forbidden', 'Admin only.', 403);
+  const body = await readJson(request);
+  if (!body) return err('invalid_json', 'Request body must be JSON.', 400);
+  if (!Number.isInteger(body.room_id)) {
+    return err('invalid_room_id', 'room_id must be an integer.', 400);
+  }
+  const roomId = body.room_id;
+  const label = parseRoomLinkLabel(body);
+  if (label.error) return label.error;
+  const ttl = parseRoomLinkTtl(body);
+  if (ttl.error) return ttl.error;
+  const room = await env.DB.prepare('SELECT id, name FROM rooms WHERE id = ?1').bind(roomId).first();
+  if (!room) return err('room_not_found', 'No such room.', 404);
+  const expiresAt = new Date(Date.now() + ttl.value * 86400000).toISOString();
+  // 32 random bytes, hex-encoded (64 chars) via hex(). On the (astronomically
+  // unlikely) PK collision, retry once with fresh bytes, then 500.
+  let token = null;
+  for (let attempt = 0; attempt < 2 && !token; attempt++) {
+    const candidate = hex(randomBytes(32));
+    try {
+      await env.DB.prepare(
+        'INSERT INTO room_links (token, room_id, label, expires_at) VALUES (?1, ?2, ?3, ?4)'
+      ).bind(candidate, roomId, label.value, expiresAt).run();
+      token = candidate;
+    } catch (e) {
+      const msg = e && e.message ? e.message : '';
+      if (!(attempt === 0 && /unique|constraint/i.test(msg))) {
+        return err('internal_error', 'Could not mint a room link.', 500);
+      }
+    }
+  }
+  if (!token) return err('internal_error', 'Could not mint a room link.', 500);
+  const tokenPrefix = token.slice(0, 8);
+  await logMod(env, 'mint_room_link', 'room', roomId,
+    `label=${label.value} ttl_days=${ttl.value} expires_at=${expiresAt} token_prefix=${tokenPrefix}`,
+    'admin:' + admin.username);
+  await logAdminAccess(env, admin, 'mint_room_link', 'room', roomId,
+    JSON.stringify({ label: label.value, ttl_days: ttl.value, expires_at: expiresAt, token_prefix: tokenPrefix }));
+  return json({
+    token,
+    url: SITE_ORIGIN + '/r/' + token,
+    room_id: roomId,
+    room_name: room.name,
+    label: label.value,
+    expires_at: expiresAt,
+  }, 201);
+}
+
+/** POST /api/admin/room-links/extend {"token": "<64 hex>", "ttl_days": 7} (admin).
+ *  Sets expires_at = now + ttl_days (from now, not from the old expiry), so
+ *  extending an already-expired link revives it under the same token/URL.
+ *  A revoked link is never resurrected: 409. Unknown token: 404. */
+async function handleAdminExtendRoomLink(request, env, admin) {
+  // Defense in depth (audit M16): do not rely on the router gate alone.
+  if (!admin || admin.username !== ADMIN_USERNAME) return err('forbidden', 'Admin only.', 403);
+  const body = await readJson(request);
+  if (!body) return err('invalid_json', 'Request body must be JSON.', 400);
+  const ttl = parseRoomLinkTtl(body);
+  if (ttl.error) return ttl.error;
+  const token = typeof body.token === 'string' ? body.token : '';
+  const link = token ? await roomLinkRowFor(env, token) : null;
+  if (!link) return err('link_not_found', 'No such room link.', 404);
+  if (link.revoked) {
+    return err('link_revoked', 'That room link has been revoked; mint a new one.', 409);
+  }
+  const expiresAt = new Date(Date.now() + ttl.value * 86400000).toISOString();
+  await env.DB.prepare('UPDATE room_links SET expires_at = ?1 WHERE token = ?2')
+    .bind(expiresAt, token).run();
+  const tokenPrefix = token.slice(0, 8);
+  await logMod(env, 'extend_room_link', 'room', link.room_id,
+    `label=${link.label} ttl_days=${ttl.value} expires_at=${expiresAt} token_prefix=${tokenPrefix}`,
+    'admin:' + admin.username);
+  await logAdminAccess(env, admin, 'extend_room_link', 'room', link.room_id,
+    JSON.stringify({ label: link.label, ttl_days: ttl.value, expires_at: expiresAt, token_prefix: tokenPrefix }));
+  return json({
+    token,
+    url: SITE_ORIGIN + '/r/' + token,
+    room_id: link.room_id,
+    room_name: link.room_name,
+    label: link.label,
+    expires_at: expiresAt,
+  });
+}
+
+/** POST /api/admin/room-links/revoke {"token": "<64 hex>"} (admin).
+ *  Sets revoked = 1; consumers refuse revoked links immediately. Idempotent
+ *  for an already-revoked link. Unknown token: 404. */
+async function handleAdminRevokeRoomLink(request, env, admin) {
+  // Defense in depth (audit M16): do not rely on the router gate alone.
+  if (!admin || admin.username !== ADMIN_USERNAME) return err('forbidden', 'Admin only.', 403);
+  const body = await readJson(request);
+  if (!body) return err('invalid_json', 'Request body must be JSON.', 400);
+  const token = typeof body.token === 'string' ? body.token : '';
+  const link = token ? await roomLinkRowFor(env, token) : null;
+  if (!link) return err('link_not_found', 'No such room link.', 404);
+  await env.DB.prepare('UPDATE room_links SET revoked = 1 WHERE token = ?1').bind(token).run();
+  const tokenPrefix = token.slice(0, 8);
+  await logMod(env, 'revoke_room_link', 'room', link.room_id,
+    `label=${link.label} token_prefix=${tokenPrefix}`, 'admin:' + admin.username);
+  await logAdminAccess(env, admin, 'revoke_room_link', 'room', link.room_id,
+    JSON.stringify({ label: link.label, expires_at: link.expires_at, token_prefix: tokenPrefix }));
+  return json({ revoked: true });
+}
+
+/** GET /api/admin/room-links?room_id=&include_expired= (admin).
+ *  Default: live links only (unrevoked and unexpired). include_expired=1
+ *  returns every link, with `expired` (roomLinkExpired rule) and `revoked`
+ *  marked per row. Rows carry token_prefix only — never the full token. */
+async function handleAdminListRoomLinks(request, env, admin) {
+  // Defense in depth (audit M16): do not rely on the router gate alone.
+  if (!admin || admin.username !== ADMIN_USERNAME) return err('forbidden', 'Admin only.', 403);
+  const u = new URL(request.url);
+  const roomParam = readIntParam(u.searchParams.get('room_id'));
+  if (!roomParam.ok) return err('invalid_room_id', 'room_id must be an integer.', 400);
+  const includeExpired = u.searchParams.get('include_expired') === '1';
+  let sql = `SELECT l.token AS token, l.room_id AS room_id, l.label AS label, l.revoked AS revoked,
+            l.created_at AS created_at, l.expires_at AS expires_at, r.name AS room_name
+     FROM room_links l JOIN rooms r ON r.id = l.room_id`;
+  const args = [];
+  if (!roomParam.missing) {
+    sql += ' WHERE l.room_id = ?1';
+    args.push(roomParam.value);
+  }
+  sql += ' ORDER BY l.created_at DESC';
+  const rows = await env.DB.prepare(sql).bind(...args).all();
+  let links = (rows.results || []).map((row) => ({
+    token_prefix: String(row.token).slice(0, 8),
+    room_id: row.room_id,
+    room_name: row.room_name,
+    label: row.label,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    revoked: row.revoked,
+    expired: roomLinkExpired(row),
+  }));
+  if (!includeExpired) links = links.filter((l) => !l.expired && !l.revoked);
+  await logAdminAccess(env, admin, 'list_room_links', 'room',
+    roomParam.missing ? null : roomParam.value,
+    JSON.stringify({
+      room_id: roomParam.missing ? null : roomParam.value,
+      include_expired: includeExpired,
+      returned: links.length,
+    }));
+  return json({ links });
+}
+
+// Named exports so tests can call the handlers directly (the M16 internal
+// admin assert must be testable without going through the router gate).
+export { handleAdminMintRoomLink, handleAdminExtendRoomLink, handleAdminListRoomLinks, handleAdminRevokeRoomLink };
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 export default {
@@ -5281,6 +5484,10 @@ export default {
       if (method === 'POST' && path === '/api/admin/files/purge-expired') return R(handleAdminPurgeExpiredFiles(request, env, admin));
       if (method === 'POST' && path === '/api/admin/send-dm') return R(handleAdminSendDm(request, env, admin));
       if (method === 'POST' && path === '/api/admin/reminders/deliver') return R(handleAdminDeliverReminders(request, env, admin));
+      if (method === 'POST' && path === '/api/admin/room-links') return R(handleAdminMintRoomLink(request, env, admin));
+      if (method === 'GET' && path === '/api/admin/room-links') return R(handleAdminListRoomLinks(request, env, admin));
+      if (method === 'POST' && path === '/api/admin/room-links/extend') return R(handleAdminExtendRoomLink(request, env, admin));
+      if (method === 'POST' && path === '/api/admin/room-links/revoke') return R(handleAdminRevokeRoomLink(request, env, admin));
       return R(err('not_found', 'Unknown admin endpoint.', 404));
     }
 
