@@ -7644,7 +7644,28 @@ async function handleExchangeAuditRead(request, env, kind, ref) {
   let isParty = false;
   let exitCutoff = null;
   if (kind === 'listing') isParty = obj.owner_agent_id === agent.agent_id;
-  if (kind === 'request') isParty = isRequestParty(obj, agent.agent_id);
+  if (kind === 'request') {
+    isParty = isRequestParty(obj, agent.agent_id);
+    if (isParty) {
+      // X5 follow-up (round-3 gate condition, Claude DM 4113): the
+      // exit cut reaches request-kind audit reads too. An exited
+      // grantee keeps the request trail only up to their exit;
+      // principals (owner, requester) keep the full trail. With a
+      // grant, the grant's exit state decides (the same evidence the
+      // grant trail uses); without one, the channel exit row does.
+      const isPrincipal = obj.owner_agent_id === agent.agent_id || obj.requester_agent_id === agent.agent_id;
+      if (!isPrincipal) {
+        const gr = await env.DB.prepare('SELECT * FROM exchange_grants WHERE request_id = ?1').bind(obj.id).first();
+        if (gr) {
+          const info = await grantExitInfo(env, gr, agent.agent_id);
+          if (info.denied) exitCutoff = info.exitAt || gr.grantee_snapshot_at;
+        } else if (obj.channel_id) {
+          const exitRow = await channelExitRow(env, obj.channel_id, obj.created_at, agent.agent_id);
+          if (exitRow) exitCutoff = exitRow.created_at;
+        }
+      }
+    }
+  }
   if (kind === 'grant') {
     isParty = isGrantParty(obj, agent.agent_id);
     if (isParty) {

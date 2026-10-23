@@ -1076,6 +1076,62 @@ async function gateRound3() {
     assert(replay.status === 404, 'a stored replay no longer re-authorizes an exited grantee, got ' + replay.status + ' ' + replay.text);
   });
 
+  await section('R3 X5 follow-up: request audit trail cut on exit', async () => {
+    // With a grant: the grant's exit state cuts the request trail.
+    const w = await makeWorld();
+    const create = await w.call('POST', '/api/v1/exchange/channels', {
+      key: KEY.owner_bot, body: { name: 'Req cut channel', purpose: 'Request audit cut checks.', invitees: ['swarm_01', 'swarm_02'] },
+    });
+    assert(create.status === 201, 'channel creates, got ' + create.status + ' ' + create.text);
+    const ch = create.json.channel;
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.swarm_01, body: {} });
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.swarm_02, body: {} });
+    const listing = await makeLiveListing(w, 'owner_bot', { kind: 'own_compute', title: 'GPU window req', audience: 'channel', channel_ref: ch.ref });
+    const req = await fileRequest(w, 'swarm_01', listing.ref, { channel_ref: ch.ref, grantee_type: 'channel', grantee_channel_ref: ch.ref });
+    const { grant } = await approveAndGrant(w, 'owner_bot', listing.human, req.ref, { performer: 'grantee' });
+    const before = await w.call('GET', `/api/v1/exchange/objects/request/${req.ref}/audit`, { key: KEY.swarm_02 });
+    assert(before.status === 200 && before.json.audit.some((a) => a.action === 'created'), 'before exit the grantee reads the request trail');
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/remove`, { key: KEY.owner_bot, body: { username: 'swarm_02' } });
+    const snap = sqlOne(w, 'SELECT grantee_snapshot_at AS s FROM exchange_grants WHERE public_ref = ?', grant.ref).s;
+    w.db.prepare("UPDATE exchange_audit SET created_at = ? WHERE object_kind = 'channel' AND action = 'member_removed'")
+      .run(new Date(Date.parse(snap) + 5).toISOString());
+    // A request-kind row written after the exit (inserted directly;
+    // the read cut is what is under test).
+    const reqId = sqlOne(w, 'SELECT id FROM exchange_requests WHERE public_ref = ?', req.ref).id;
+    w.db.prepare("INSERT INTO exchange_audit (object_kind, object_id, actor_agent_id, action, detail_json, created_at) VALUES ('request', ?, NULL, 'post_exit_marker', '{}', ?)")
+      .run(reqId, new Date(Date.parse(snap) + 60000).toISOString());
+    const cut = await w.call('GET', `/api/v1/exchange/objects/request/${req.ref}/audit`, { key: KEY.swarm_02 });
+    assert(cut.status === 200 && cut.json.audit.some((a) => a.action === 'created')
+      && !cut.json.audit.some((a) => a.action === 'post_exit_marker'),
+      'after exit the request trail stops at the exit, got ' + JSON.stringify((cut.json.audit || []).map((a) => a.action)));
+    const ownerView = await w.call('GET', `/api/v1/exchange/objects/request/${req.ref}/audit`, { key: KEY.owner_bot });
+    assert(ownerView.json.audit.some((a) => a.action === 'post_exit_marker'), 'the owner keeps the full request trail');
+
+    // Without a grant: the channel exit row cuts the request trail.
+    const w2 = await makeWorld();
+    const create2 = await w2.call('POST', '/api/v1/exchange/channels', {
+      key: KEY.owner_bot, body: { name: 'Req cut early', purpose: 'Pre-grant exit cut checks.', invitees: ['swarm_01', 'swarm_02'] },
+    });
+    assert(create2.status === 201, 'second channel creates, got ' + create2.status + ' ' + create2.text);
+    const ch2 = create2.json.channel;
+    await w2.call('POST', `/api/v1/exchange/channels/${ch2.ref}/accept`, { key: KEY.swarm_01, body: {} });
+    await w2.call('POST', `/api/v1/exchange/channels/${ch2.ref}/accept`, { key: KEY.swarm_02, body: {} });
+    const listing2 = await makeLiveListing(w2, 'owner_bot', { kind: 'own_compute', title: 'GPU window early', audience: 'channel', channel_ref: ch2.ref });
+    const req2 = await fileRequest(w2, 'swarm_01', listing2.ref, { channel_ref: ch2.ref, grantee_type: 'channel', grantee_channel_ref: ch2.ref });
+    const pre = await w2.call('GET', `/api/v1/exchange/objects/request/${req2.ref}/audit`, { key: KEY.swarm_02 });
+    assert(pre.status === 200 && pre.json.audit.some((a) => a.action === 'created'), 'before exit the grantee reads the pre-grant request trail');
+    const leave = await w2.call('POST', `/api/v1/exchange/channels/${ch2.ref}/leave`, { key: KEY.swarm_02, body: {} });
+    assert(leave.status === 200, 'the grantee leaves before any grant, got ' + leave.status + ' ' + leave.text);
+    const deny = await w2.call('POST', `/api/v1/exchange/requests/${req2.ref}/deny`, { key: KEY.owner_bot, body: { reason: 'No capacity this week.' } });
+    assert(deny.status === 200, 'the owner denies after the exit, got ' + deny.status + ' ' + deny.text);
+    const cut2 = await w2.call('GET', `/api/v1/exchange/objects/request/${req2.ref}/audit`, { key: KEY.swarm_02 });
+    assert(cut2.status === 200 && cut2.json.audit.some((a) => a.action === 'created')
+      && !cut2.json.audit.some((a) => a.action === 'denied'),
+      'after a pre-grant exit the request trail stops at the exit, got ' + JSON.stringify((cut2.json.audit || []).map((a) => a.action)));
+    const ownerView2 = await w2.call('GET', `/api/v1/exchange/objects/request/${req2.ref}/audit`, { key: KEY.owner_bot });
+    assert(ownerView2.json.audit.some((a) => a.action === 'denied'), 'the owner keeps the full pre-grant request trail');
+  });
+
   await section('R3 idempotency placeholders expire: a stale reservation frees the key', async () => {
     const w = await makeWorld();
     const body = { kind: 'own_service', title: 'TTL pass', description: 'A pass for the placeholder TTL check.' };
