@@ -5491,6 +5491,9 @@ const EXCHANGE_EVENT_TYPES = new Set([
 const EXCHANGE_LAUNCH_KINDS = new Set(['own_service', 'own_compute', 'own_dataset', 'human_service']);
 const EXCHANGE_RESULT_MAX_BYTES = 10 * 1024 * 1024;
 const EXCHANGE_APPROVAL_TTL_MS = 24 * 3600000;
+/** Gate round 3: a status-0 idempotency reservation older than this
+ *  counts as free (its isolate died before recording the outcome). */
+const EXCHANGE_IDEM_PLACEHOLDER_TTL_MS = 120000;
 const EXCHANGE_TAKEDOWN_CONTACT = 'abuse@tryoids.com';
 
 function exchangeEnabled(env) {
@@ -5625,7 +5628,7 @@ async function exchangeIdem(request, env, agent, operation, targetRef, body, rec
   const target = targetRef || '';
   const payloadHash = await sha256hex(stableStringify(body || {}));
   const prior = await env.DB.prepare(
-    `SELECT operation, target_ref, response_status, response_body, payload_hash FROM exchange_idempotency
+    `SELECT operation, target_ref, response_status, response_body, payload_hash, created_at FROM exchange_idempotency
      WHERE actor_agent_id = ?1 AND idempotency_key = ?2`
   ).bind(agent.agent_id, key).all();
   const priorRows = prior.results || [];
@@ -5646,9 +5649,21 @@ async function exchangeIdem(request, env, agent, operation, targetRef, body, rec
     return json(JSON.parse(existing.response_body), existing.response_status);
   }
   if (existing) {
-    // A row with status 0 is a live reservation held by a concurrent
-    // call carrying the same key: this call loses the race (D5).
-    return err('idempotency_conflict', 'This Idempotency-Key is already in use by a concurrent request.', 409);
+    // A row with status 0 is a reservation held by a concurrent call
+    // carrying the same key: this call loses the race (D5). But a
+    // reservation whose isolate died before recording (or whose
+    // record UPDATE failed) must not hold the key forever: past a
+    // short TTL the placeholder counts as free and is dropped, so
+    // the retry below can claim the key fresh (gate round 3).
+    const ageMs = Date.now() - Date.parse(existing.created_at || '');
+    if (!(Number.isFinite(ageMs) && ageMs > EXCHANGE_IDEM_PLACEHOLDER_TTL_MS)) {
+      return err('idempotency_conflict', 'This Idempotency-Key is already in use by a concurrent request.', 409);
+    }
+    try {
+      await env.DB.prepare(
+        `DELETE FROM exchange_idempotency WHERE actor_agent_id = ?1 AND operation = ?2 AND target_ref = ?3 AND idempotency_key = ?4 AND response_status = 0`
+      ).bind(agent.agent_id, operation, target, key).run();
+    } catch { /* if the drop loses a race, the claim below answers 409 */ }
   }
   try {
     await env.DB.prepare(
@@ -5799,9 +5814,16 @@ async function exchangeSweep(env, ctx) {
   await env.DB.prepare(
     `UPDATE exchange_approvals SET status = 'expired' WHERE status = 'pending' AND approval_expires_at <= ?1`
   ).bind(now).run();
-  // Retention (Doors gate condition): door audit rows name the agent
-  // who entered; strip the actor id 90 days after the row was
-  // written. The row itself stays as the record of what happened.
+  await exchangeDoorAuditStrip(env);
+}
+
+/** Retention (Doors gate condition): door audit rows name the agent
+ *  who entered; strip the actor id 90 days after the row was
+ *  written. The row itself stays as the record of what happened.
+ *  This is compliance bookkeeping, not state sweeping: it runs even
+ *  when EXCHANGE_SWEEP_DISABLED is set (gate round 3), because the
+ *  test switch must never suspend a retention duty. */
+async function exchangeDoorAuditStrip(env) {
   const stripCutoff = new Date(Date.now() - 90 * 86400000).toISOString();
   await env.DB.prepare(
     `UPDATE exchange_audit SET actor_agent_id = NULL
@@ -6693,6 +6715,13 @@ async function handleExchangeApprove(request, env, ctx, ref) {
       return err('bad_grantee_set', 'An approval can narrow the proposed grantee set, never widen it beyond the request.', 400);
     }
   }
+  // X1 (gate round 3): an empty grantee set is never approved. With
+  // nobody named, the result-recipient set is empty too, and the
+  // attachment share check has no recipient to bind to — the exact
+  // hole the round-2 gate found (channel emptied before approval).
+  if (!granteeIds.length) {
+    return err('bad_grantee_set', 'The grantee set for this request is empty (for a channel grantee, the channel currently has no members). A grant must name at least one grantee; nobody can be granted to nobody.', 400);
+  }
   const disclosure = body.disclosure_context === undefined ? {} : body.disclosure_context;
   if (disclosure === null || typeof disclosure !== 'object' || Array.isArray(disclosure)) {
     return err('bad_disclosure', 'disclosure_context must be a JSON object.', 400);
@@ -6830,6 +6859,11 @@ async function handleExchangeGrant(request, env, ctx, ref) {
           granteeIds.push(a.id);
         }
       }
+      // X1 (gate round 3): fail closed at grant as well as approve —
+      // a pre-fix approval row carrying an empty set mints nothing.
+      if (!granteeIds.length) {
+        return err('bad_grantee_set', 'The grantee set for this grant is empty. A grant must name at least one grantee; nobody can be granted to nobody.', 400);
+      }
       const disclosure = body.disclosure_context === undefined ? JSON.parse(approval.disclosure_context || '{}') : body.disclosure_context;
       const derived = {
         attestation_revision: listing.attestation_revision,
@@ -6854,44 +6888,49 @@ async function handleExchangeGrant(request, env, ctx, ref) {
         }
       }
       const now = new Date().toISOString();
-      // Single consumption (D1): the guarded approval UPDATE lands
-      // first; if it matches no row, nothing else is written.
-      const consume = await env.DB.prepare(
-        `UPDATE exchange_approvals SET status = 'consumed', consumed_at = ?1 WHERE id = ?2 AND status = 'pending'`
-      ).bind(now, approval.id).run();
-      if (consume.meta.changes !== 1) {
-        return err('human_approval_required', 'That approval record was just consumed or withdrawn. A fresh human approval is needed.', 403);
-      }
       const grantRef = exchangeRef();
       const idemKey = request.headers.get('Idempotency-Key') || '';
-      let grantIns;
-      try {
-        grantIns = await env.DB.prepare(
-          `INSERT INTO exchange_grants (public_ref, request_id, listing_id, listing_revision, attestation_revision,
-             owner_agent_id, requester_agent_id, grantee_type, grantee_channel_id, grantee_ids, grantee_snapshot_at,
-             scope, performer, status, max_uses, uses_declared, expires_at, approval_id, human_approved_by,
-             human_approved_at, disclosure_context, idempotency_key, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'active', ?14, 0, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)`
-        ).bind(grantRef, reqRow.id, listing.id, listing.revision, listing.attestation_revision,
-          agent.agent_id, reqRow.requester_agent_id, reqRow.grantee_type, reqRow.grantee_channel_id,
-          JSON.stringify([...new Set(granteeIds)].sort((a, b) => a - b)), now,
-          scope, performer, approval.max_uses, approval.grant_expires_at, approval.id,
-          approval.approved_by, approval.created_at, approval.disclosure_context, idemKey, now).run();
-      } catch (e) {
-        // Roll the consumption back: the grant did not land.
-        await env.DB.prepare(`UPDATE exchange_approvals SET status = 'pending', consumed_at = NULL WHERE id = ?1`).bind(approval.id).run();
-        throw e;
-      }
-      const grantId = grantIns.meta.last_row_id;
-      await env.DB.prepare(`UPDATE exchange_approvals SET consumed_grant_id = ?1 WHERE id = ?2`).bind(grantId, approval.id).run();
       // X4: the listing owner stays the request owner for the life of
       // the request. The performer principal is recorded in its own
       // column instead of overwriting owner_agent_id.
       const performerAgentId = performer === 'owner' ? agent.agent_id : reqRow.requester_agent_id;
-      await env.DB.prepare(
-        `UPDATE exchange_requests SET status = 'active', performer_agent_id = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'requested'`
-      ).bind(performerAgentId, now, reqRow.id).run();
-      const grant = await env.DB.prepare('SELECT * FROM exchange_grants WHERE id = ?1').bind(grantId).first();
+      // Atomicity (gate round 3): consumption, grant insert,
+      // consumed_grant_id link, and the request transition land in
+      // ONE batch. The insert is conditional on this call's own
+      // consumption (status flipped by statement 1 with this call's
+      // timestamp), so a lost consumption race writes nothing at
+      // all — no manual rollback path remains.
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE exchange_approvals SET status = 'consumed', consumed_at = ?1 WHERE id = ?2 AND status = 'pending'`
+        ).bind(now, approval.id),
+        env.DB.prepare(
+          `INSERT INTO exchange_grants (public_ref, request_id, listing_id, listing_revision, attestation_revision,
+             owner_agent_id, requester_agent_id, grantee_type, grantee_channel_id, grantee_ids, grantee_snapshot_at,
+             scope, performer, status, max_uses, uses_declared, expires_at, approval_id, human_approved_by,
+             human_approved_at, disclosure_context, idempotency_key, created_at, updated_at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'active', ?14, 0, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+           WHERE EXISTS (SELECT 1 FROM exchange_approvals WHERE id = ?23 AND status = 'consumed' AND consumed_at = ?24)`
+        ).bind(grantRef, reqRow.id, listing.id, listing.revision, listing.attestation_revision,
+          agent.agent_id, reqRow.requester_agent_id, reqRow.grantee_type, reqRow.grantee_channel_id,
+          JSON.stringify([...new Set(granteeIds)].sort((a, b) => a - b)), now,
+          scope, performer, approval.max_uses, approval.grant_expires_at, approval.id,
+          approval.approved_by, approval.created_at, approval.disclosure_context, idemKey, now, now,
+          approval.id, now),
+        env.DB.prepare(
+          `UPDATE exchange_approvals SET consumed_grant_id = (SELECT id FROM exchange_grants WHERE public_ref = ?1)
+           WHERE id = ?2 AND EXISTS (SELECT 1 FROM exchange_grants WHERE public_ref = ?1)`
+        ).bind(grantRef, approval.id),
+        env.DB.prepare(
+          `UPDATE exchange_requests SET status = 'active', performer_agent_id = ?1, updated_at = ?2
+           WHERE id = ?3 AND status = 'requested' AND EXISTS (SELECT 1 FROM exchange_grants WHERE public_ref = ?4)`
+        ).bind(performerAgentId, now, reqRow.id, grantRef),
+      ]);
+      const grant = await env.DB.prepare('SELECT * FROM exchange_grants WHERE public_ref = ?1').bind(grantRef).first();
+      if (!grant) {
+        return err('human_approval_required', 'That approval record was just consumed or withdrawn. A fresh human approval is needed.', 403);
+      }
+      const grantId = grant.id;
       await exchangeAudit(env, 'grant', grantId, agent.agent_id, 'granted', 'requested', 'active',
         { grant_id: grantId, request_id: reqRow.id, approval_id: approval.id, canonical_hash: approval.canonical_hash });
       await emitExchangeEvent(env, ctx, 'exchange.granted',
@@ -6965,7 +7004,19 @@ async function handleExchangeGetRequest(request, env, ref) {
   if (error) return error;
   const r = await getRequestByRef(env, ref);
   if (!r) return err('not_found', 'No such request.', 404);
-  if (isRequestParty(r, agent.agent_id)) return json({ request: await requestView(env, r, agent) });
+  if (isRequestParty(r, agent.agent_id)) {
+    // X5 (gate round 3): the exit cut reaches the request view too.
+    // A non-principal grantee who exited the linked channel gets the
+    // state-only projection, exactly as on the grant view.
+    const isPrincipal = r.owner_agent_id === agent.agent_id || r.requester_agent_id === agent.agent_id;
+    if (!isPrincipal) {
+      const gr = await env.DB.prepare('SELECT * FROM exchange_grants WHERE request_id = ?1').bind(r.id).first();
+      if (gr && (await grantExitInfo(env, gr, agent.agent_id)).denied) {
+        return json({ request: requestStateView(r), projection: 'state_only' });
+      }
+    }
+    return json({ request: await requestView(env, r, agent) });
+  }
   if (/^\d+$/.test(String(ref))) return err('not_found', 'No such request.', 404);
   // Coordinator (not a leg party) and channel observers: state only.
   if (r.exchange_id) {
@@ -7001,6 +7052,26 @@ async function grantExitDenied(env, g, actorId) {
   return null;
 }
 
+/** Gate round 3 (X5 completed): grantExitDenied as a yes/no plus the
+ *  exit timestamp when a leave/remove row exists, so read surfaces
+ *  can cut an exited grantee's view at their exit instead of only
+ *  refusing actions. exitAt is null when the denial rests on current
+ *  non-membership with no recorded exit row. */
+async function grantExitInfo(env, g, actorId) {
+  let channelId = g.grantee_channel_id || null;
+  if (!channelId) {
+    const reqRow = await env.DB.prepare('SELECT channel_id FROM exchange_requests WHERE id = ?1').bind(g.request_id).first();
+    if (reqRow) channelId = reqRow.channel_id;
+  }
+  if (!channelId) return { denied: false, exitAt: null };
+  const ch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(channelId).first();
+  if (!ch) return { denied: false, exitAt: null };
+  const exitRow = await channelExitRow(env, ch.id, g.grantee_snapshot_at, actorId);
+  if (exitRow) return { denied: true, exitAt: exitRow.created_at };
+  if (g.grantee_type === 'channel' && !(await channelMember(env, ch, actorId))) return { denied: true, exitAt: null };
+  return { denied: false, exitAt: null };
+}
+
 // --- Grant transitions --------------------------------------------------------
 
 function grantCounterpartyOk(g, actorId) {
@@ -7031,6 +7102,14 @@ async function exchangeCheckResultFile(env, g, actor, fileId) {
   if (!file) return { error: err('not_found', 'No such file.', 404) };
   if (Date.parse(file.expires_at) <= Date.now()) return { error: err('bad_file', 'That file has expired.', 400) };
   const recipients = grantResultRecipients(g);
+  // X1 (gate round 3): fail closed when the recipient set is empty.
+  // The share loop below iterates the recipients; with zero of them
+  // it never runs, and in round 2 a non-uploader could attach any
+  // file to such a grant. An empty set now refuses everyone,
+  // uploader included: there is nobody the result is for.
+  if (!recipients.length) {
+    return { error: err('bad_grantee_set', 'This grant names no result recipients (its grantee set is empty), so no result file can be attached to it.', 400) };
+  }
   const isUploader = file.agent_id === actor.agent_id;
   if (!isUploader) {
     // X1: reading a file is not authority to attach it. A non-uploader
@@ -7114,7 +7193,10 @@ async function handleExchangeGrantDone(request, env, ctx, ref) {
   return exchangeIdem(request, env, agent, 'grant.done', ref, body,
     async () => {
       const g = await getGrantByRef(env, ref);
-      return !!g && isGrantParty(g, agent.agent_id);
+      // X5 (gate round 3): a stored replay is a read of the full
+      // grant response, so the exit cut applies here too — an
+      // exited grantee's replay re-authorizes as not found.
+      return !!g && isGrantParty(g, agent.agent_id) && !(await grantExitDenied(env, g, agent.agent_id));
     },
     async () => {
       const fieldErr = exchangeFields(body, new Set(['result_file_id']));
@@ -7199,26 +7281,37 @@ async function handleExchangeGrantConfirm(request, env, ctx, ref) {
       ).bind(g.id).first();
       if (existing) return err('receipt_exists', 'A receipt already exists for this grant. One grant mints at most one receipt.', 400);
       const now = new Date().toISOString();
-      const upd = await env.DB.prepare(
-        `UPDATE exchange_grants SET status = 'confirmed', updated_at = ?1 WHERE id = ?2 AND status = 'done' AND expires_at > ?1`
-      ).bind(now, g.id).run();
-      if (upd.meta.changes !== 1) return err('bad_request', 'This grant has no completion awaiting confirmation.', 400);
       const reqRow = await env.DB.prepare('SELECT listing_title FROM exchange_requests WHERE id = ?1').bind(g.request_id).first();
       const subjOp = await env.DB.prepare('SELECT operator_id FROM agent_operators WHERE agent_id = ?1').bind(g.done_by_agent_id).first();
       const confOp = await env.DB.prepare('SELECT operator_id FROM agent_operators WHERE agent_id = ?1').bind(agent.agent_id).first();
       const receiptRef = exchangeRef();
-      const receiptIns = await env.DB.prepare(
-        `INSERT INTO receipts (public_ref, kind, source_id, subject_agent_id, confirmer_agent_id, source_title, price_cents, currency, funded, started_at, subject_operator, confirmer_operator, created_at)
-         VALUES (?9, 'exchange', ?1, ?2, ?3, ?4, NULL, NULL, 0, ?5, ?6, ?7, ?8)`
-      ).bind(g.id, g.done_by_agent_id, agent.agent_id, reqRow ? reqRow.listing_title : null, g.created_at,
-        subjOp ? subjOp.operator_id : 'unknown', confOp ? confOp.operator_id : 'unknown', now, receiptRef).run();
-      await env.DB.prepare(
-        `UPDATE exchange_requests SET status = 'confirmed', updated_at = ?1 WHERE id = ?2`
-      ).bind(now, g.request_id).run();
+      // Atomicity (gate round 3): the grant transition, the receipt
+      // insert, and the request transition land in ONE batch, so a
+      // throw can never leave a confirmed grant with no receipt. The
+      // receipt insert is conditional on this call's own transition
+      // (statement 1 with this call's timestamp); if the guarded
+      // update missed, nothing is written at all.
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE exchange_grants SET status = 'confirmed', updated_at = ?1 WHERE id = ?2 AND status = 'done' AND expires_at > ?1`
+        ).bind(now, g.id),
+        env.DB.prepare(
+          `INSERT INTO receipts (public_ref, kind, source_id, subject_agent_id, confirmer_agent_id, source_title, price_cents, currency, funded, started_at, subject_operator, confirmer_operator, created_at)
+           SELECT ?1, 'exchange', ?2, ?3, ?4, ?5, NULL, NULL, 0, ?6, ?7, ?8, ?9
+           WHERE EXISTS (SELECT 1 FROM exchange_grants WHERE id = ?10 AND status = 'confirmed' AND updated_at = ?11)`
+        ).bind(receiptRef, g.id, g.done_by_agent_id, agent.agent_id, reqRow ? reqRow.listing_title : null, g.created_at,
+          subjOp ? subjOp.operator_id : 'unknown', confOp ? confOp.operator_id : 'unknown', now, g.id, now),
+        env.DB.prepare(
+          `UPDATE exchange_requests SET status = 'confirmed', updated_at = ?1 WHERE id = ?2
+           AND EXISTS (SELECT 1 FROM receipts WHERE public_ref = ?3)`
+        ).bind(now, g.request_id, receiptRef),
+      ]);
+      const receiptRow = await env.DB.prepare('SELECT id FROM receipts WHERE public_ref = ?1').bind(receiptRef).first();
+      if (!receiptRow) return err('bad_request', 'This grant has no completion awaiting confirmation.', 400);
       await exchangeAudit(env, 'grant', g.id, agent.agent_id, 'confirmed', 'done', 'confirmed',
-        { grant_id: g.id, receipt_id: receiptIns.meta.last_row_id });
-      await exchangeAudit(env, 'receipt', receiptIns.meta.last_row_id, agent.agent_id, 'minted', null, 'confirmed_by_counterparty',
-        { receipt_id: receiptIns.meta.last_row_id, grant_id: g.id });
+        { grant_id: g.id, receipt_id: receiptRow.id });
+      await exchangeAudit(env, 'receipt', receiptRow.id, agent.agent_id, 'minted', null, 'confirmed_by_counterparty',
+        { receipt_id: receiptRow.id, grant_id: g.id });
       await emitExchangeEvent(env, ctx, 'exchange.confirmed',
         { grant_ref: g.public_ref, receipt_ref: receiptRef, state: 'confirmed' },
         [g.owner_agent_id, g.requester_agent_id, ...parseIdList(g.grantee_ids)]);
@@ -7453,8 +7546,14 @@ async function handleExchangeGetExchange(request, env, ref) {
   if (!isCoordinator && !isLegParty && !isObserver) return err('not_found', 'No such exchange.', 404);
   const legViews = [];
   for (const r of legRows) {
-    if (isRequestParty(r, agent.agent_id)) legViews.push(await requestView(env, r, agent));
-    else legViews.push(requestStateView(r));
+    let full = isRequestParty(r, agent.agent_id);
+    if (full && r.owner_agent_id !== agent.agent_id && r.requester_agent_id !== agent.agent_id) {
+      // X5 (gate round 3): the exit cut reaches leg views as well —
+      // an exited grantee sees their leg state-only here too.
+      const gr = await env.DB.prepare('SELECT * FROM exchange_grants WHERE request_id = ?1').bind(r.id).first();
+      if (gr && (await grantExitInfo(env, gr, agent.agent_id)).denied) full = false;
+    }
+    legViews.push(full ? await requestView(env, r, agent) : requestStateView(r));
   }
   return json({
     exchange: {
@@ -7518,7 +7617,19 @@ async function handleExchangeAuditRead(request, env, kind, ref) {
   let exitCutoff = null;
   if (kind === 'listing') isParty = obj.owner_agent_id === agent.agent_id;
   if (kind === 'request') isParty = isRequestParty(obj, agent.agent_id);
-  if (kind === 'grant') isParty = isGrantParty(obj, agent.agent_id);
+  if (kind === 'grant') {
+    isParty = isGrantParty(obj, agent.agent_id);
+    if (isParty) {
+      // X5 (gate round 3): an exited grantee keeps the grant trail
+      // only up to their exit — the same cutoff the channel trail
+      // already applies. Principals keep the full trail.
+      const isPrincipal = obj.owner_agent_id === agent.agent_id || obj.requester_agent_id === agent.agent_id;
+      if (!isPrincipal) {
+        const info = await grantExitInfo(env, obj, agent.agent_id);
+        if (info.denied) exitCutoff = info.exitAt || obj.grantee_snapshot_at;
+      }
+    }
+  }
   if (kind === 'exchange') {
     isParty = obj.coordinator_agent_id === agent.agent_id;
     if (!isParty) {
@@ -7836,8 +7947,11 @@ async function handleExchangeRoute(request, env, ctx, path, method) {
   if (!exchangeEnabled(env)) return err('not_found', 'Not found.', 404);
   // The sweep is lazy bookkeeping; every handler also checks
   // authoritative time itself. EXCHANGE_SWEEP_DISABLED=1 is an
-  // internal test/diagnostic switch that proves exactly that.
+  // internal test/diagnostic switch that proves exactly that. The
+  // switch is env-only (no caller can set it), and even when set
+  // the 90-day door-audit retention strip still runs (gate round 3).
   if (!env || env.EXCHANGE_SWEEP_DISABLED !== '1') await exchangeSweep(env, ctx);
+  else if (env) await exchangeDoorAuditStrip(env);
   const seg = path.split('/').filter(Boolean); // api, v1, exchange, ...
   const sub = seg.slice(3);
   if (method === 'POST' && sub.length === 1 && sub[0] === 'human-session') return handleExchangeHumanSession(request, env);

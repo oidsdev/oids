@@ -268,6 +268,12 @@ function seedFile(w, agentId, r2Key, filename, contentType, text) {
 }
 function sqlOne(w, sql, ...args) { return w.db.prepare(sql).get(...args); }
 function sqlAll(w, sql, ...args) { return w.db.prepare(sql).all(...args); }
+/** Mirror of the worker's stableStringify (sorted keys, compact). */
+function stableStr(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(stableStr).join(',') + ']';
+  return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + stableStr(v[k])).join(',') + '}';
+}
 
 const results = [];
 async function section(name, fn) {
@@ -942,6 +948,188 @@ async function gateRound2() {
   });
 }
 
+// ===========================================================================
+// Gate round 3 (file 991): B1 rebase evidence lives in the suite list
+// itself (security_pass_2 runs in this tree now); these sections pin
+// X1, the remaining conditions, and the completed X5 exit cuts.
+// ===========================================================================
+async function gateRound3() {
+  await section('R3 X1 empty grantee set: approve refuses, grant refuses, attach fails closed', async () => {
+    // (1) The gate's exact sequence: the requester makes a channel,
+    // files a channel request, invites the owner (who never joins),
+    // and leaves. At approval the membership — hence the grantee
+    // set — is empty.
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Empty-set pass' });
+    const chCreate = await w.call('POST', '/api/v1/exchange/channels', {
+      key: KEY.borrower_bot, body: { name: 'Empty room', purpose: 'Attack fixture.', invitees: ['owner_bot'] },
+    });
+    assert(chCreate.status === 201, 'requester channel creates, got ' + chCreate.status + ' ' + chCreate.text);
+    const ch = chCreate.json.channel;
+    const req = await fileRequest(w, 'borrower_bot', listing.ref, { channel_ref: ch.ref, grantee_type: 'channel', grantee_channel_ref: ch.ref });
+    const leave = await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/leave`, { key: KEY.borrower_bot, body: {} });
+    assert(leave.status === 200, 'requester leaves, emptying the channel, got ' + leave.status + ' ' + leave.text);
+    const approve = await w.call('POST', `/api/v1/exchange/requests/${req.ref}/approve`, {
+      human: listing.human, idem: false,
+      body: { scope: 'One review pass over the attached draft.', performer: 'owner', expires_at: futureIso(7) },
+    });
+    assert(approve.status === 400 && approve.json.error === 'bad_grantee_set',
+      'approve refuses an empty grantee set, got ' + approve.status + ' ' + approve.text);
+    assert(sqlOne(w, 'SELECT COUNT(*) AS n FROM exchange_approvals').n === 0, 'no approval row was written');
+
+    // (2) Grant-time refusal: a pre-fix-style approval row whose set
+    // is empty (canonical hash updated to match, so only the empty
+    // set can refuse it) still mints nothing.
+    const w2 = await makeWorld();
+    const listing2 = await makeLiveListing(w2, 'owner_bot', { title: 'Empty-set grant pass' });
+    const req2 = await fileRequest(w2, 'borrower_bot', listing2.ref);
+    const exp2 = futureIso(7);
+    const scope2 = 'One review pass over the attached draft.';
+    const ap = await w2.call('POST', `/api/v1/exchange/requests/${req2.ref}/approve`, {
+      human: listing2.human, idem: false,
+      body: { scope: scope2, performer: 'owner', expires_at: exp2 },
+    });
+    assert(ap.status === 201, 'baseline approval records, got ' + ap.status + ' ' + ap.text);
+    const apRow = sqlOne(w2, 'SELECT * FROM exchange_approvals WHERE public_ref = ?', ap.json.approval.ref);
+    const proposal = JSON.parse(apRow.canonical_json);
+    proposal.grantee_ids = [];
+    const emptyHash = await sha256hex(stableStr(proposal));
+    w2.db.prepare('UPDATE exchange_approvals SET grantee_ids = ?, canonical_hash = ? WHERE id = ?').run('[]', emptyHash, apRow.id);
+    const grant2 = await w2.call('POST', `/api/v1/exchange/requests/${req2.ref}/grant`, {
+      key: KEY.owner_bot, body: { approval_ref: ap.json.approval.ref, scope: scope2, performer: 'owner', expires_at: exp2 },
+    });
+    assert(grant2.status === 400 && grant2.json.error === 'bad_grantee_set',
+      'grant refuses an empty grantee set, got ' + grant2.status + ' ' + grant2.text);
+    assert(sqlOne(w2, 'SELECT COUNT(*) AS n FROM exchange_grants').n === 0, 'no grant row was written');
+    assert(sqlOne(w2, 'SELECT status FROM exchange_approvals WHERE id = ?', apRow.id).status === 'pending', 'the approval was not consumed');
+
+    // (3) Fail closed at attach: a crafted grant whose grantee set
+    // is empty (what a round-2 grant could be) accepts no result
+    // file — not a third party's, not even the performer's own.
+    const w3 = await makeWorld();
+    const listing3 = await makeLiveListing(w3, 'owner_bot', { title: 'Empty-set attach pass' });
+    const req3 = await fileRequest(w3, 'borrower_bot', listing3.ref);
+    const ap3 = await w3.call('POST', `/api/v1/exchange/requests/${req3.ref}/approve`, {
+      human: listing3.human, idem: false,
+      body: { scope: scope2, performer: 'owner', expires_at: futureIso(7) },
+    });
+    assert(ap3.status === 201, 'approval for the crafted grant records, got ' + ap3.status + ' ' + ap3.text);
+    const reqRow3 = sqlOne(w3, 'SELECT * FROM exchange_requests WHERE public_ref = ?', req3.ref);
+    const apRow3 = sqlOne(w3, 'SELECT * FROM exchange_approvals WHERE public_ref = ?', ap3.json.approval.ref);
+    const now3 = new Date().toISOString();
+    w3.db.prepare(
+      `INSERT INTO exchange_grants (public_ref, request_id, listing_id, listing_revision, attestation_revision,
+         owner_agent_id, requester_agent_id, grantee_type, grantee_channel_id, grantee_ids, grantee_snapshot_at,
+         scope, performer, status, max_uses, uses_declared, expires_at, approval_id, human_approved_by,
+         human_approved_at, disclosure_context, idempotency_key, created_at, updated_at)
+       VALUES ('exg_r3crafted', ?, ?, ?, ?, 1, 2, 'agent', NULL, '[]', ?, 'Crafted scope.', 'owner', 'active',
+         NULL, 0, ?, ?, 'Operator of @owner_bot', ?, '{}', 'crafted-r3', ?, ?)`
+    ).run(reqRow3.id, reqRow3.listing_id, reqRow3.listing_revision, apRow3.attestation_revision,
+      now3, futureIso(7), apRow3.id, now3, now3, now3);
+    const thirdFile = seedFile(w3, 3, 'r3-third-file', 'third.txt', 'text/plain', 'Third party content.');
+    const ownFile = seedFile(w3, 1, 'r3-own-file', 'own.txt', 'text/plain', 'Owner content.');
+    const doneThird = await w3.call('POST', '/api/v1/exchange/grants/exg_r3crafted/done', { key: KEY.owner_bot, body: { result_file_id: thirdFile } });
+    assert(doneThird.status === 400 && doneThird.json.error === 'bad_grantee_set',
+      'attach of a third-party file fails closed, got ' + doneThird.status + ' ' + doneThird.text);
+    const doneOwn = await w3.call('POST', '/api/v1/exchange/grants/exg_r3crafted/done', { key: KEY.owner_bot, body: { result_file_id: ownFile } });
+    assert(doneOwn.status === 400 && doneOwn.json.error === 'bad_grantee_set',
+      'attach of the performer own file also fails closed, got ' + doneOwn.status + ' ' + doneOwn.text);
+    const grow = sqlOne(w3, "SELECT status, uses_declared FROM exchange_grants WHERE public_ref = 'exg_r3crafted'");
+    assert(grow.status === 'active' && grow.uses_declared === 0, 'the crafted grant never moved');
+  });
+
+  await section('R3 X5 exit cuts: request view, grant audit trail, stored replay', async () => {
+    const w = await makeWorld();
+    const create = await w.call('POST', '/api/v1/exchange/channels', {
+      key: KEY.owner_bot, body: { name: 'Cut channel', purpose: 'Exit cut checks.', invitees: ['swarm_01', 'swarm_02'] },
+    });
+    assert(create.status === 201, 'channel creates, got ' + create.status + ' ' + create.text);
+    const ch = create.json.channel;
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.swarm_01, body: {} });
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/accept`, { key: KEY.swarm_02, body: {} });
+    const listing = await makeLiveListing(w, 'owner_bot', { kind: 'own_compute', title: 'GPU window', audience: 'channel', channel_ref: ch.ref });
+    const req = await fileRequest(w, 'swarm_01', listing.ref, { channel_ref: ch.ref, grantee_type: 'channel', grantee_channel_ref: ch.ref });
+    const { grant } = await approveAndGrant(w, 'owner_bot', listing.human, req.ref, { performer: 'grantee' });
+    const done = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.swarm_02, idem: 'r3-done-key', body: {} });
+    assert(done.status === 200, 'grantee declares done before exiting, got ' + done.status + ' ' + done.text);
+    const fullReq = await w.call('GET', `/api/v1/exchange/requests/${req.ref}`, { key: KEY.swarm_02 });
+    assert(fullReq.status === 200 && 'scope' in fullReq.json.request, 'before exit the grantee reads the full request view');
+    const fullAudit = await w.call('GET', `/api/v1/exchange/objects/grant/${grant.ref}/audit`, { key: KEY.swarm_02 });
+    assert(fullAudit.status === 200 && fullAudit.json.audit.some((a) => a.action === 'done'), 'before exit the grantee reads the grant trail');
+    await w.call('POST', `/api/v1/exchange/channels/${ch.ref}/remove`, { key: KEY.owner_bot, body: { username: 'swarm_02' } });
+    // Pin the exit a breath after the approval snapshot so the
+    // cutoff ordering does not depend on millisecond ties.
+    const snap = sqlOne(w, 'SELECT grantee_snapshot_at AS s FROM exchange_grants WHERE public_ref = ?', grant.ref).s;
+    w.db.prepare("UPDATE exchange_audit SET created_at = ? WHERE object_kind = 'channel' AND action = 'member_removed'")
+      .run(new Date(Date.parse(snap) + 5).toISOString());
+    const cutReq = await w.call('GET', `/api/v1/exchange/requests/${req.ref}`, { key: KEY.swarm_02 });
+    assert(cutReq.json.projection === 'state_only' && !('scope' in cutReq.json.request),
+      'after exit the request view is state-only, got ' + JSON.stringify(cutReq.json));
+    const reopen = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/reopen`, { key: KEY.owner_bot, body: {} });
+    assert(reopen.status === 200, 'the counterparty reopens after the exit, got ' + reopen.status + ' ' + reopen.text);
+    const cutAudit = await w.call('GET', `/api/v1/exchange/objects/grant/${grant.ref}/audit`, { key: KEY.swarm_02 });
+    assert(cutAudit.status === 200 && !cutAudit.json.audit.some((a) => a.action === 'reopened'),
+      'after exit the grant trail stops at the exit, got ' + JSON.stringify((cutAudit.json.audit || []).map((a) => a.action)));
+    const ownerAudit = await w.call('GET', `/api/v1/exchange/objects/grant/${grant.ref}/audit`, { key: KEY.owner_bot });
+    assert(ownerAudit.json.audit.some((a) => a.action === 'reopened'), 'the owner keeps the full grant trail');
+    const replay = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.swarm_02, idem: 'r3-done-key', body: {} });
+    assert(replay.status === 404, 'a stored replay no longer re-authorizes an exited grantee, got ' + replay.status + ' ' + replay.text);
+  });
+
+  await section('R3 idempotency placeholders expire: a stale reservation frees the key', async () => {
+    const w = await makeWorld();
+    const body = { kind: 'own_service', title: 'TTL pass', description: 'A pass for the placeholder TTL check.' };
+    const hash = await sha256hex(JSON.stringify({ description: body.description, kind: body.kind, title: body.title }));
+    const ins = w.db.prepare("INSERT INTO exchange_idempotency (actor_agent_id, operation, target_ref, idempotency_key, payload_hash, response_status, response_body, created_at) VALUES (1, 'listing.create', '', ?, ?, 0, '', ?)");
+    ins.run('stale-1', hash, new Date(Date.now() - 10 * 60000).toISOString());
+    const freed = await w.call('POST', '/api/v1/exchange/listings', { key: KEY.owner_bot, idem: 'stale-1', body });
+    assert(freed.status === 201, 'a stale placeholder counts as free and the retry runs, got ' + freed.status + ' ' + freed.text);
+    ins.run('fresh-1', hash, new Date().toISOString());
+    const blocked = await w.call('POST', '/api/v1/exchange/listings', { key: KEY.owner_bot, idem: 'fresh-1', body });
+    assert(blocked.status === 409 && blocked.json.error === 'idempotency_conflict', 'a fresh placeholder still blocks, got ' + blocked.status + ' ' + blocked.text);
+  });
+
+  await section('R3 grant and confirm land atomically (all-or-nothing invariants)', async () => {
+    const w = await makeWorld();
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Atomic pass' });
+    const req = await fileRequest(w, 'borrower_bot', listing.ref);
+    const { approval, grant } = await approveAndGrant(w, 'owner_bot', listing.human, req.ref, {});
+    const apRow = sqlOne(w, 'SELECT status, consumed_grant_id FROM exchange_approvals WHERE public_ref = ?', approval.ref);
+    const gRow = sqlOne(w, 'SELECT id FROM exchange_grants WHERE public_ref = ?', grant.ref);
+    assert(apRow.status === 'consumed' && apRow.consumed_grant_id === gRow.id, 'consumption and the grant link landed together');
+    assert(sqlOne(w, 'SELECT status FROM exchange_requests WHERE public_ref = ?', req.ref).status === 'active', 'the request transition landed in the same step');
+    const again = await w.call('POST', `/api/v1/exchange/requests/${req.ref}/grant`, {
+      key: KEY.owner_bot, body: { approval_ref: approval.ref, scope: 'One review pass over the attached draft.', expires_at: futureIso(7) },
+    });
+    assert(again.status >= 400 && again.status < 500 && sqlOne(w, 'SELECT COUNT(*) AS n FROM exchange_grants').n === 1
+      && sqlOne(w, 'SELECT consumed_grant_id FROM exchange_approvals WHERE public_ref = ?', approval.ref).consumed_grant_id === gRow.id,
+      'a second grant on the consumed approval writes nothing, got ' + again.status + ' ' + again.text);
+    const done = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/done`, { key: KEY.owner_bot, body: {} });
+    assert(done.status === 200, 'done lands, got ' + done.status + ' ' + done.text);
+    const conf = await w.call('POST', `/api/v1/exchange/grants/${grant.ref}/confirm`, { key: KEY.borrower_bot, body: {} });
+    assert(conf.status === 200 && conf.json.receipt && conf.json.receipt.ref, 'confirm mints the receipt, got ' + conf.status + ' ' + conf.text);
+    assert(sqlOne(w, 'SELECT status FROM exchange_grants WHERE public_ref = ?', grant.ref).status === 'confirmed', 'grant confirmed');
+    assert(sqlOne(w, 'SELECT status FROM exchange_requests WHERE public_ref = ?', req.ref).status === 'confirmed', 'request confirmed in the same step');
+    assert(sqlOne(w, "SELECT COUNT(*) AS n FROM receipts WHERE kind = 'exchange'").n === 1, 'exactly one receipt exists');
+  });
+
+  await section('R3 sweep switch never suspends the 90-day door-audit strip', async () => {
+    const w = await makeWorld({ sweepOff: true });
+    const old = new Date(Date.now() - 100 * 86400000).toISOString();
+    const recent = new Date(Date.now() - 86400000).toISOString();
+    const ins = w.db.prepare("INSERT INTO exchange_audit (object_kind, object_id, actor_agent_id, action, detail_json, created_at) VALUES ('listing', 1, ?, ?, '{}', ?)");
+    ins.run(2, 'door_created', old);
+    ins.run(2, 'granted', old);
+    ins.run(2, 'door_created', recent);
+    const list = await w.call('GET', '/api/v1/exchange/listings', { key: KEY.owner_bot });
+    assert(list.status === 200, 'a route runs under the disabled sweep, got ' + list.status);
+    const rows = sqlAll(w, 'SELECT action, actor_agent_id FROM exchange_audit ORDER BY id');
+    assert(rows[0].actor_agent_id === null, 'the old door row lost its actor id even with the sweep disabled');
+    assert(rows[1].actor_agent_id === 2, 'old non-door rows keep their actor id');
+    assert(rows[2].actor_agent_id === 2, 'recent door rows keep their actor id');
+  });
+}
+
 
 // ===========================================================================
 // Fixtures E1-E7 (build spec §10, with Dot delta coverage)
@@ -1338,6 +1526,7 @@ async function main() {
   await channelsAndMultiParty();
   await fixtures();
   await gateRound2();
+  await gateRound3();
   const failed = results.filter(([, s]) => s !== 'PASS');
   console.log('');
   for (const [name, s] of results) console.log((s === 'PASS' ? 'PASS ' : 'FAIL ') + name + (s === 'PASS' ? '' : ' — ' + s.slice(5)));

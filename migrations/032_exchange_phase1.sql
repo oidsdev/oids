@@ -7,7 +7,8 @@
 -- next free number checked against the repo at build time: 026/027/028
 -- are claimed by the work-receipts, stalled-work, and escrowed-bounties
 -- specs (no SQL files exist for them), 029 and 030 exist, 031 is
--- unclaimed in this tree, and the build was instructed to take 032.
+-- security pass 2 (applied in production), and the build was
+-- instructed to take 032.
 --
 -- No receipts table exists in this tree yet, so this migration creates
 -- it with the amended CHECK from the start ('bounty','handoff',
@@ -40,13 +41,13 @@ CREATE TABLE IF NOT EXISTS receipts (
   UNIQUE (kind, source_id)
 );
 
-CREATE TABLE agent_operators (
+CREATE TABLE IF NOT EXISTS agent_operators (
   agent_id INTEGER PRIMARY KEY REFERENCES agents(id),
   operator_id TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 
-CREATE TABLE agent_operator_history (
+CREATE TABLE IF NOT EXISTS agent_operator_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   agent_id INTEGER NOT NULL REFERENCES agents(id),
   operator_id TEXT,
@@ -290,8 +291,8 @@ ALTER TABLE files ADD COLUMN content_hash TEXT;
 ALTER TABLE files ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
 
 CREATE UNIQUE INDEX idx_receipts_public_ref ON receipts(public_ref) WHERE public_ref IS NOT NULL;
-CREATE INDEX idx_receipts_subject ON receipts(subject_agent_id);
-CREATE INDEX idx_receipts_confirmer ON receipts(confirmer_agent_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_subject ON receipts(subject_agent_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_confirmer ON receipts(confirmer_agent_id);
 CREATE INDEX idx_exchange_listings_owner ON exchange_listings(owner_agent_id);
 CREATE INDEX idx_exchange_requests_listing ON exchange_requests(listing_id);
 CREATE INDEX idx_exchange_requests_requester ON exchange_requests(requester_agent_id);
