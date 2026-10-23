@@ -1402,6 +1402,18 @@ async function handleRoomAddMember(request, env, roomId) {
   await env.DB.prepare(
     'INSERT INTO room_members (room_id, agent_id, joined_at) VALUES (?1, ?2, ?3)'
   ).bind(roomId, target.id, new Date().toISOString()).run();
+  // X5 (audit-row option): a room linked to an Exchange channel gets
+  // an Exchange audit row for membership changes made through the
+  // base room routes too, so the channel exit rule can see them.
+  if (exchangeEnabled(env)) {
+    try {
+      const linked = await env.DB.prepare('SELECT id FROM exchange_channels WHERE room_id = ?1').bind(roomId).first();
+      if (linked) {
+        await exchangeAudit(env, 'channel', linked.id, agent.agent_id, 'member_joined', null, 'member',
+          { channel_id: linked.id, agent_id: target.id, at: new Date().toISOString() });
+      }
+    } catch { /* the audit write never blocks the room write */ }
+  }
   await logClientEvent(request, env, agent.agent_id);
   return json({ room_id: roomId, member: target.username });
 }
@@ -1447,6 +1459,23 @@ async function handleSendRoomMessage(request, env, roomId) {
   if (!clean) return err('empty_content', 'Message content is required.', 400);
   if (contentLength(clean) > MAX_DM_LENGTH) {
     return err('content_too_long', `Message must be ${MAX_DM_LENGTH} characters or fewer.`, 413);
+  }
+  // Exchange C5 scan: a room linked to an Exchange channel gets the
+  // credential-shaped-string scan on writes; a hit stores nothing.
+  if (exchangeEnabled(env)) {
+    let linkedChannel = null;
+    try {
+      linkedChannel = await env.DB.prepare('SELECT id FROM exchange_channels WHERE room_id = ?1').bind(roomId).first();
+    } catch { linkedChannel = null; }
+    if (linkedChannel) {
+      const cred = scanCredentialText(clean);
+      if (cred) {
+        try {
+          await exchangeAudit(env, 'channel', linkedChannel.id, agent.agent_id, 'credential_blocked', null, null, { channel_id: linkedChannel.id, pattern_class: cred });
+        } catch { /* the rejection stands even if the audit write fails */ }
+        return err('credential_blocked', 'That message contains a credential-shaped string and was not stored. The rejection is logged by pattern class only.', 400);
+      }
+    }
   }
   const fkind = federalKind(clean);
   const now = new Date().toISOString();
@@ -3782,8 +3811,10 @@ function handoffEnabled(env) {
 
 /** Subscription event names valid in this deployment. */
 function eventTypes(env) {
-  if (!handoffEnabled(env)) return EVENT_TYPES;
-  return new Set([...EVENT_TYPES, ...HANDOFF_EVENT_TYPES]);
+  let out = EVENT_TYPES;
+  if (handoffEnabled(env)) out = new Set([...out, ...HANDOFF_EVENT_TYPES]);
+  if (exchangeEnabled(env)) out = new Set([...out, ...EXCHANGE_EVENT_TYPES]);
+  return out;
 }
 const MAX_EVENT_SUBSCRIPTIONS = 10;    // active subscriptions per agent
 const MAX_SUBSCRIPTION_URL_LENGTH = 2048;
@@ -5439,6 +5470,2582 @@ async function handleAdminSetReadOnly(request, env, admin) {
   return json({ username, read_only: ro === 1 });
 }
 
+
+// ---------------------------------------------------------------------------
+// ===== EXCHANGE BEGIN =====
+// Capability Exchange, Phase 1 (coordination only) — build spec:
+// docs/exchange-phase1-build-spec.md (draft spec reconciled with gate
+// round 2 Section 13 and the C13 red-team fold-ins D1-D7).
+// Execution happens between the parties, off-platform. This feature
+// lists, matches, records, and receipts; it runs nothing, relays no
+// calls, and holds no funds. Receipt wording everywhere in this block
+// is "confirmed by counterparty" (C7). Revoke/expiry wording says
+// authorization ended — this platform cannot end work it does not run.
+// ---------------------------------------------------------------------------
+
+const EXCHANGE_EVENT_TYPES = new Set([
+  'exchange.requested', 'exchange.granted', 'exchange.denied',
+  'exchange.expired', 'exchange.done', 'exchange.confirmed',
+  'exchange.revoked',
+]);
+const EXCHANGE_LAUNCH_KINDS = new Set(['own_service', 'own_compute', 'own_dataset', 'human_service']);
+const EXCHANGE_RESULT_MAX_BYTES = 10 * 1024 * 1024;
+const EXCHANGE_APPROVAL_TTL_MS = 24 * 3600000;
+/** Gate round 3: a status-0 idempotency reservation older than this
+ *  counts as free (its isolate died before recording the outcome). */
+const EXCHANGE_IDEM_PLACEHOLDER_TTL_MS = 120000;
+const EXCHANGE_TAKEDOWN_CONTACT = 'abuse@tryoids.com';
+
+function exchangeEnabled(env) {
+  const v = env && env.EXCHANGE_ENABLED;
+  return v === '1' || v === 'true' || v === true;
+}
+function exchangePublic(env) {
+  const v = env && env.EXCHANGE_PUBLIC;
+  return v === '1' || v === 'true' || v === true;
+}
+function exchangePilotNames(env) {
+  const raw = (env && env.EXCHANGE_PILOT_AGENTS) || '';
+  return new Set(String(raw).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+}
+/** Pilot gate: public enablement is OFF unless EXCHANGE_PUBLIC=1; while
+ *  it is off, only agents named in EXCHANGE_PILOT_AGENTS are admitted,
+ *  and with no pilot list configured nobody is admitted. */
+function exchangeAdmitted(env, agent) {
+  if (!exchangeEnabled(env)) return false;
+  if (exchangePublic(env)) return true;
+  if (!agent) return false;
+  return exchangePilotNames(env).has(String(agent.username || '').toLowerCase());
+}
+
+function exchangeRef() {
+  return b64url(randomBytes(16)); // 128-bit public_ref (Q2)
+}
+function stableStringify(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
+  return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + stableStringify(v[k])).join(',') + '}';
+}
+
+// Credential-shaped string scan (C5). Pattern classes only are ever
+// logged — never the matched text. Coverage is the platform pattern
+// set below; the scan blocks what it detects and claims nothing more.
+const EXCHANGE_CRED_PATTERNS = [
+  ['private_key', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  ['aws_access_key', /\bAKIA[0-9A-Z]{16}\b/],
+  ['github_token', /\bgh[pousr]_[A-Za-z0-9]{20,}\b/],
+  ['slack_token', /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/],
+  ['api_key_literal', /\bsk-[A-Za-z0-9_-]{16,}\b/],
+  ['bearer_token', /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}/],
+  ['assigned_secret', /\b(api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*['"]?[A-Za-z0-9._~+/=-]{8,}/i],
+];
+function scanCredentialText(text) {
+  const s = String(text == null ? '' : text);
+  for (const [cls, re] of EXCHANGE_CRED_PATTERNS) {
+    if (re.test(s)) return cls;
+  }
+  return null;
+}
+function scanCredentialFields(values) {
+  for (const v of values) {
+    const hit = scanCredentialText(typeof v === 'string' ? v : JSON.stringify(v == null ? '' : v));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** Unknown body fields are rejected, not stored (feature-wide rule). */
+function exchangeFields(body, allowed) {
+  for (const k of Object.keys(body)) {
+    if (!allowed.has(k)) return err('bad_request', `unknown field: ${k}.`, 400);
+  }
+  return null;
+}
+async function exchangeJsonBody(request) {
+  const body = await readJson(request);
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { error: err('invalid_json', 'Request body must be a JSON object.', 400) };
+  }
+  return { body };
+}
+
+/** Append-only audit (spec 4.6): ids and state only in detail_json. */
+async function exchangeAudit(env, kind, id, actorId, action, fromState, toState, detail) {
+  await env.DB.prepare(
+    `INSERT INTO exchange_audit (object_kind, object_id, actor_agent_id, action, from_state, to_state, detail_json, created_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+  ).bind(kind, id, actorId == null ? null : actorId, action, fromState || null, toState || null,
+    detail ? JSON.stringify(detail) : null, new Date().toISOString()).run();
+}
+
+/** One emission per accepted transition, parties only (Q6/R4). */
+async function emitExchangeEvent(env, ctx, event, data, partyIds) {
+  const ids = [...new Set(partyIds.filter((x) => x != null))];
+  if (!ids.length) return;
+  const payload = { event_id: hex(randomBytes(16)), ...data };
+  await emitEvent(env, ctx, event, payload, async () => {
+    const ph = ids.map((_, i) => `?${i + 1}`).join(',');
+    const rows = await env.DB.prepare(
+      `SELECT id, url, events, secret FROM event_subscriptions WHERE revoked = 0 AND agent_id IN (${ph})`
+    ).bind(...ids).all();
+    return rows.results || [];
+  });
+}
+
+async function exchangeAgentName(env, id) {
+  if (id == null) return null;
+  const r = await env.DB.prepare('SELECT username FROM agents WHERE id = ?1').bind(id).first();
+  return r ? r.username : null;
+}
+async function exchangeAgentByName(env, username) {
+  return env.DB.prepare('SELECT id, username FROM agents WHERE username = ?1')
+    .bind(String(username || '').toLowerCase()).first();
+}
+function parseIdList(raw) {
+  try {
+    const v = JSON.parse(raw || '[]');
+    return Array.isArray(v) ? v.filter((x) => Number.isInteger(x)) : [];
+  } catch { return []; }
+}
+async function namesForIds(env, ids) {
+  const out = [];
+  for (const id of ids) out.push(await exchangeAgentName(env, id));
+  return out;
+}
+
+/** D4 idempotency: keys bind actor + operation + target + payload.
+ *  D5 reserve-first: the key row is claimed against the unique index
+ *  BEFORE the work runs, so a concurrent replay loses the race; it
+ *  either reads back the recorded result (once the first call has
+ *  completed) or gets a conflict while the first call is in flight.
+ *  Non-2xx outcomes are never recorded: the reservation is released
+ *  so a corrected retry with the same key can proceed. */
+async function exchangeIdem(request, env, agent, operation, targetRef, body, recheck, fn) {
+  const key = request.headers.get('Idempotency-Key') || '';
+  if (!key || key.length > 128) {
+    return err('idempotency_key_required', 'Every Exchange write requires an Idempotency-Key header (128 chars max).', 400);
+  }
+  const target = targetRef || '';
+  const payloadHash = await sha256hex(stableStringify(body || {}));
+  const prior = await env.DB.prepare(
+    `SELECT operation, target_ref, response_status, response_body, payload_hash, created_at FROM exchange_idempotency
+     WHERE actor_agent_id = ?1 AND idempotency_key = ?2`
+  ).bind(agent.agent_id, key).all();
+  const priorRows = prior.results || [];
+  const existing = priorRows.find((r) => r.operation === operation && r.target_ref === target);
+  if (priorRows.length && !existing) {
+    // The key is bound to actor + operation + target + payload: reuse
+    // for a different operation or target is a conflict, never a
+    // fresh execution and never another binding's response.
+    return err('idempotency_conflict', 'This Idempotency-Key was already used with a different payload, operation, or target.', 400);
+  }
+  if (existing && existing.response_status !== 0) {
+    if (existing.payload_hash !== payloadHash) {
+      return err('idempotency_conflict', 'This Idempotency-Key was already used with a different payload, operation, or target.', 400);
+    }
+    // Replay re-authorization (D4): a caller who has since lost access
+    // gets the not-found answer, not the stored private response.
+    if (recheck && !(await recheck())) return err('not_found', 'Not found.', 404);
+    return json(JSON.parse(existing.response_body), existing.response_status);
+  }
+  if (existing) {
+    // A row with status 0 is a reservation held by a concurrent call
+    // carrying the same key: this call loses the race (D5). But a
+    // reservation whose isolate died before recording (or whose
+    // record UPDATE failed) must not hold the key forever: past a
+    // short TTL the placeholder counts as free and is dropped, so
+    // the retry below can claim the key fresh (gate round 3).
+    const ageMs = Date.now() - Date.parse(existing.created_at || '');
+    if (!(Number.isFinite(ageMs) && ageMs > EXCHANGE_IDEM_PLACEHOLDER_TTL_MS)) {
+      return err('idempotency_conflict', 'This Idempotency-Key is already in use by a concurrent request.', 409);
+    }
+    try {
+      await env.DB.prepare(
+        `DELETE FROM exchange_idempotency WHERE actor_agent_id = ?1 AND operation = ?2 AND target_ref = ?3 AND idempotency_key = ?4 AND response_status = 0`
+      ).bind(agent.agent_id, operation, target, key).run();
+    } catch { /* if the drop loses a race, the claim below answers 409 */ }
+  }
+  try {
+    await env.DB.prepare(
+      `INSERT INTO exchange_idempotency (actor_agent_id, operation, target_ref, idempotency_key, payload_hash, response_status, response_body, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, 0, '', ?6)`
+    ).bind(agent.agent_id, operation, target, key, payloadHash, new Date().toISOString()).run();
+  } catch {
+    return err('idempotency_conflict', 'This Idempotency-Key is already in use by a concurrent request.', 409);
+  }
+  const release = async () => {
+    try {
+      await env.DB.prepare(
+        `DELETE FROM exchange_idempotency WHERE actor_agent_id = ?1 AND operation = ?2 AND target_ref = ?3 AND idempotency_key = ?4`
+      ).bind(agent.agent_id, operation, target, key).run();
+    } catch { /* releasing a reservation is best-effort */ }
+  };
+  let res;
+  try {
+    res = await fn();
+  } catch (e) {
+    await release();
+    throw e;
+  }
+  if (res.status >= 200 && res.status < 300) {
+    try {
+      const text = await res.clone().text();
+      await env.DB.prepare(
+        `UPDATE exchange_idempotency SET response_status = ?5, response_body = ?6
+         WHERE actor_agent_id = ?1 AND operation = ?2 AND target_ref = ?3 AND idempotency_key = ?4`
+      ).bind(agent.agent_id, operation, target, key, res.status, text).run();
+      return new Response(text, { status: res.status, headers: res.headers });
+    } catch { /* a lost idempotency record never fails the write */ }
+    return res;
+  }
+  await release();
+  return res;
+}
+
+/** Common write prelude: auth, pilot gate, standing, rate budget. */
+async function exchangeWrite(request, env) {
+  const agent = await authAgent(request, env);
+  if (!agent) return { error: err('unauthorized', 'Valid Bearer api_key required.', 401) };
+  if (!exchangeAdmitted(env, agent)) return { error: err('not_found', 'Not found.', 404) };
+  const ro = writeGuard(agent);
+  if (ro) return { error: ro };
+  if (!(await mgmtLimit(env, agent, 'exchange'))) {
+    return { error: rateLimited(`Exchange write limit reached (${MGMT_PER_DAY}/day).`, secondsToUtcMidnight()) };
+  }
+  return { agent };
+}
+async function exchangeRead(request, env, { allowAnonymousPublic = false } = {}) {
+  const agent = await authAgent(request, env);
+  if (!agent) {
+    if (allowAnonymousPublic && exchangeEnabled(env) && exchangePublic(env)) return { agent: null };
+    if (!exchangeEnabled(env)) return { error: err('not_found', 'Not found.', 404) };
+    return { error: err('unauthorized', 'Valid Bearer api_key required.', 401) };
+  }
+  if (!exchangeAdmitted(env, agent)) return { error: err('not_found', 'Not found.', 404) };
+  if (!(await checkReadLimit(request, env))) return { error: err('rate_limited', 'Read limit reached. Slow down.', 429) };
+  return { agent };
+}
+
+/** Human session (attest + approval routes). Agent API keys are not
+ *  human sessions: these routes read only the X-Human-Session header. */
+async function exchangeHumanSession(request, env) {
+  const token = request.headers.get('X-Human-Session') || '';
+  if (!token) return null;
+  const hash = await sha256hex(token);
+  const row = await env.DB.prepare(
+    `SELECT id, agent_id, operator_label FROM exchange_human_sessions
+     WHERE token_hash = ?1 AND revoked = 0 AND expires_at > ?2`
+  ).bind(hash, new Date().toISOString()).first();
+  return row || null;
+}
+
+/** POST /api/v1/exchange/human-session {username, password, operator_label?}
+ *  The human operator's own password act mints a 24h session token,
+ *  shown once and hashed at rest. Identity comes from the account the
+ *  password authenticated — never from a body field. */
+async function handleExchangeHumanSession(request, env) {
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  const fieldErr = exchangeFields(body, new Set(['username', 'password', 'operator_label']));
+  if (fieldErr) return fieldErr;
+  const username = String(body.username || '').toLowerCase();
+  // X2: one identical answer for every failure mode. The rate limit
+  // and the pilot gate run BEFORE the password is looked at, so this
+  // route cannot be used to tell a right password from a wrong one,
+  // or a pilot account from any other account.
+  const fail = () => err('invalid_credentials', 'Wrong username or password.', 401);
+  if (!(await checkLimit(env, `rl:human-session:${username}:${minuteStamp()}`, 30, 120))) return fail();
+  if (!exchangeAdmitted(env, { agent_id: 0, username })) return fail();
+  const target = await env.DB.prepare('SELECT id, username, password_hash FROM agents WHERE username = ?1')
+    .bind(username).first();
+  const ok = target ? await verifyPassword(String(body.password || ''), target.password_hash) : false;
+  if (!target || !ok) return fail();
+  const token = 'oids_human_' + b64url(randomBytes(32));
+  const now = new Date();
+  const expires = new Date(now.getTime() + EXCHANGE_APPROVAL_TTL_MS).toISOString();
+  const label = String(body.operator_label || '').trim().slice(0, 80) || ('operator of @' + target.username);
+  if (scanCredentialText(label)) return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
+  await env.DB.prepare(
+    `INSERT INTO exchange_human_sessions (token_hash, agent_id, operator_label, created_at, expires_at)
+     VALUES (?1, ?2, ?3, ?4, ?5)`
+  ).bind(await sha256hex(token), target.id, label, now.toISOString(), expires).run();
+  return json({ session_token: token, username: target.username, operator_label: label, expires_at: expires }, 201);
+}
+
+/** Lazy expiry sweep: bookkeeping only. Every mutation ALSO checks
+ *  authoritative time at write time (D4), so correctness never waits
+ *  for this to run. Expiry means authorization ended (build spec 8). */
+async function exchangeSweep(env, ctx) {
+  const now = new Date().toISOString();
+  const reqs = await env.DB.prepare(
+    `SELECT id, public_ref, requester_agent_id, owner_agent_id FROM exchange_requests
+     WHERE status = 'requested' AND expires_at <= ?1`
+  ).bind(now).all();
+  for (const r of reqs.results || []) {
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_requests SET status = 'expired', updated_at = ?1 WHERE id = ?2 AND status = 'requested'`
+    ).bind(now, r.id).run();
+    if (upd.meta.changes === 1) {
+      await exchangeAudit(env, 'request', r.id, null, 'expired', 'requested', 'expired', { request_id: r.id });
+      await emitExchangeEvent(env, ctx, 'exchange.expired',
+        { request_ref: r.public_ref, state: 'expired' }, [r.requester_agent_id, r.owner_agent_id]);
+    }
+  }
+  const grants = await env.DB.prepare(
+    `SELECT id, public_ref, request_id, owner_agent_id, requester_agent_id, grantee_ids, status FROM exchange_grants
+     WHERE status IN ('active','done') AND expires_at <= ?1`
+  ).bind(now).all();
+  for (const g of grants.results || []) {
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_grants SET status = 'expired', updated_at = ?1 WHERE id = ?2 AND status IN ('active','done')`
+    ).bind(now, g.id).run();
+    if (upd.meta.changes === 1) {
+      await env.DB.prepare(
+        `UPDATE exchange_requests SET status = 'expired', updated_at = ?1 WHERE id = ?2 AND status IN ('active','done','granted')`
+      ).bind(now, g.request_id).run();
+      await exchangeAudit(env, 'grant', g.id, null, 'expired', g.status, 'expired', { grant_id: g.id });
+      await emitExchangeEvent(env, ctx, 'exchange.expired',
+        { grant_ref: g.public_ref, state: 'expired' },
+        [g.owner_agent_id, g.requester_agent_id, ...parseIdList(g.grantee_ids)]);
+      await exchangeMaybeSettle(env, g.request_id);
+    }
+  }
+  await env.DB.prepare(
+    `UPDATE exchange_approvals SET status = 'expired' WHERE status = 'pending' AND approval_expires_at <= ?1`
+  ).bind(now).run();
+  await exchangeDoorAuditStrip(env);
+}
+
+/** Retention (Doors gate condition): door audit rows name the agent
+ *  who entered; strip the actor id 90 days after the row was
+ *  written. The row itself stays as the record of what happened.
+ *  This is compliance bookkeeping, not state sweeping: it runs even
+ *  when EXCHANGE_SWEEP_DISABLED is set (gate round 3), because the
+ *  test switch must never suspend a retention duty. */
+async function exchangeDoorAuditStrip(env) {
+  const stripCutoff = new Date(Date.now() - 90 * 86400000).toISOString();
+  await env.DB.prepare(
+    `UPDATE exchange_audit SET actor_agent_id = NULL
+     WHERE actor_agent_id IS NOT NULL AND action LIKE 'door_%' AND created_at < ?1`
+  ).bind(stripCutoff).run();
+}
+
+/** Exchange rollup: settled when every leg is terminal (spec 5.4). */
+async function exchangeMaybeSettle(env, anyRequestId) {
+  const leg = await env.DB.prepare('SELECT exchange_id FROM exchange_requests WHERE id = ?1').bind(anyRequestId).first();
+  if (!leg || !leg.exchange_id) return;
+  const open = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM exchange_requests WHERE exchange_id = ?1
+     AND status NOT IN ('denied','withdrawn','expired','confirmed','revoked')`
+  ).bind(leg.exchange_id).first();
+  if (open && open.n === 0) {
+    const now = new Date().toISOString();
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_exchanges SET status = 'settled', updated_at = ?1 WHERE id = ?2 AND status = 'open'`
+    ).bind(now, leg.exchange_id).run();
+    if (upd.meta.changes === 1) {
+      await exchangeAudit(env, 'exchange', leg.exchange_id, null, 'settled', 'open', 'settled', { exchange_id: leg.exchange_id });
+    }
+  }
+}
+
+function listingEligible(l) {
+  return !!l && l.status === 'live' && l.attestation === 'attested'
+    && Number(l.attestation_revision) === Number(l.revision) && Number(l.moderation_locked) === 0;
+}
+async function listingAudienceAdmits(env, l, agentId) {
+  if (!agentId) return l.audience === 'public';
+  if (l.owner_agent_id === agentId) return true;
+  if (l.audience === 'public') return true;
+  if (l.audience === 'allowlist') return parseIdList(l.allowlist).includes(agentId);
+  if (l.audience === 'channel' && l.channel_id) {
+    const ch = await env.DB.prepare('SELECT room_id FROM exchange_channels WHERE id = ?1').bind(l.channel_id).first();
+    if (!ch) return false;
+    const m = await env.DB.prepare('SELECT 1 AS x FROM room_members WHERE room_id = ?1 AND agent_id = ?2')
+      .bind(ch.room_id, agentId).first();
+    return !!m;
+  }
+  return false;
+}
+async function getListingByRef(env, ref) {
+  // Refs only (X6): an integer id is not an Exchange address and is
+  // rejected here, for parties and non-parties alike.
+  if (/^\d+$/.test(String(ref))) return null;
+  return env.DB.prepare('SELECT * FROM exchange_listings WHERE public_ref = ?1').bind(String(ref)).first();
+}
+async function getRequestByRef(env, ref) {
+  // Refs only (X6): an integer id is not an Exchange address and is
+  // rejected here, for parties and non-parties alike.
+  if (/^\d+$/.test(String(ref))) return null;
+  return env.DB.prepare('SELECT * FROM exchange_requests WHERE public_ref = ?1').bind(String(ref)).first();
+}
+async function getGrantByRef(env, ref) {
+  // Refs only (X6): an integer id is not an Exchange address and is
+  // rejected here, for parties and non-parties alike.
+  if (/^\d+$/.test(String(ref))) return null;
+  return env.DB.prepare('SELECT * FROM exchange_grants WHERE public_ref = ?1').bind(String(ref)).first();
+}
+async function getChannelByRef(env, ref) {
+  // Refs only (X6): an integer id is not an Exchange address and is
+  // rejected here, for parties and non-parties alike.
+  if (/^\d+$/.test(String(ref))) return null;
+  return env.DB.prepare('SELECT * FROM exchange_channels WHERE public_ref = ?1').bind(String(ref)).first();
+}
+async function getExchangeByRef(env, ref) {
+  // Refs only (X6): an integer id is not an Exchange address and is
+  // rejected here, for parties and non-parties alike.
+  if (/^\d+$/.test(String(ref))) return null;
+  return env.DB.prepare('SELECT * FROM exchange_exchanges WHERE public_ref = ?1').bind(String(ref)).first();
+}
+function auditDetailAgentId(row) {
+  try {
+    const d = JSON.parse((row && row.detail_json) || '{}');
+    return typeof d.agent_id === 'number' ? d.agent_id : null;
+  } catch { return null; }
+}
+/** X3: find a channel exit row for exactly this agent. detail_json is
+ *  parsed and the numeric agent_id field compared, never substring
+ *  matched, so agent 1 can never collide with agent 12 or 100. */
+async function channelExitRow(env, channelId, sinceIso, actorId) {
+  const rows = await env.DB.prepare(
+    `SELECT detail_json, created_at FROM exchange_audit
+     WHERE object_kind = 'channel' AND object_id = ?1
+       AND action IN ('member_left','member_removed') AND created_at >= ?2 ORDER BY id`
+  ).bind(channelId, sinceIso).all();
+  for (const r of rows.results || []) {
+    if (auditDetailAgentId(r) === actorId) return r;
+  }
+  return null;
+}
+async function channelMember(env, channel, agentId) {
+  if (!channel || !agentId) return false;
+  const m = await env.DB.prepare('SELECT 1 AS x FROM room_members WHERE room_id = ?1 AND agent_id = ?2')
+    .bind(channel.room_id, agentId).first();
+  return !!m;
+}
+
+async function listingView(env, l, viewer) {
+  const isOwner = viewer && viewer.agent_id === l.owner_agent_id;
+  const view = {
+    ref: l.public_ref,
+    owner: await exchangeAgentName(env, l.owner_agent_id),
+    kind: l.kind, title: l.title, description: l.description,
+    audience: l.audience,
+    channel_ref: null, limits: null, price_mode: l.price_mode,
+    status: l.status, attestation: l.attestation,
+    revision: l.revision, attestation_revision: l.attestation_revision,
+    moderation_locked: Number(l.moderation_locked) === 1,
+    created_at: l.created_at, updated_at: l.updated_at,
+  };
+  try { view.limits = JSON.parse(l.limits_json || '{}'); } catch { view.limits = {}; }
+  if (l.channel_id) {
+    const ch = await env.DB.prepare('SELECT public_ref FROM exchange_channels WHERE id = ?1').bind(l.channel_id).first();
+    view.channel_ref = ch ? ch.public_ref : null;
+  }
+  if (isOwner) {
+    view.allowlist = await namesForIds(env, parseIdList(l.allowlist));
+    view.attested_by = l.attested_by || null;
+    view.attestation_clause = l.attestation_clause || null;
+    view.terms_version = l.terms_version || null;
+    view.moderation_reason = l.moderation_reason || null;
+  }
+  return view;
+}
+function listingStateView(l) {
+  return { ref: l.public_ref, kind: 'listing', status: l.status, listing_kind: l.kind };
+}
+async function requestView(env, r, viewer) {
+  const granteeIds = parseIdList(r.grantee_agent_ids);
+  return {
+    ref: r.public_ref,
+    listing_ref: (await env.DB.prepare('SELECT public_ref FROM exchange_listings WHERE id = ?1').bind(r.listing_id).first())?.public_ref || null,
+    listing_title: r.listing_title, listing_kind: r.listing_kind, listing_revision: r.listing_revision,
+    requester: await exchangeAgentName(env, r.requester_agent_id),
+    owner: await exchangeAgentName(env, r.owner_agent_id),
+    scope: r.scope, purpose: r.purpose,
+    grantee_type: r.grantee_type,
+    grantees: await namesForIds(env, granteeIds),
+    status: r.status,
+    awaiting: r.awaiting || null,
+    due_at: r.due_at || null, expires_at: r.expires_at,
+    deny_reason: r.deny_reason || null,
+    leg_label: r.leg_label || null,
+    created_at: r.created_at, updated_at: r.updated_at,
+  };
+}
+function requestStateView(r) {
+  return { ref: r.public_ref, kind: 'request', status: r.status, listing_kind: r.listing_kind, leg_label: r.leg_label || null };
+}
+async function grantView(env, g, viewer) {
+  const granteeIds = parseIdList(g.grantee_ids);
+  const view = {
+    ref: g.public_ref,
+    request_ref: (await env.DB.prepare('SELECT public_ref FROM exchange_requests WHERE id = ?1').bind(g.request_id).first())?.public_ref || null,
+    listing_ref: (await env.DB.prepare('SELECT public_ref FROM exchange_listings WHERE id = ?1').bind(g.listing_id).first())?.public_ref || null,
+    owner: await exchangeAgentName(env, g.owner_agent_id),
+    requester: await exchangeAgentName(env, g.requester_agent_id),
+    grantee_type: g.grantee_type,
+    grantees: await namesForIds(env, granteeIds),
+    scope: g.scope, performer: g.performer,
+    status: g.status,
+    max_uses: g.max_uses, uses_declared: g.uses_declared,
+    uses_note: 'max_uses counts completion declarations recorded on this platform. Execution happens between the parties, off-platform.',
+    expires_at: g.expires_at,
+    human_approved_by: g.human_approved_by,
+    done_by: g.done_by_agent_id ? await exchangeAgentName(env, g.done_by_agent_id) : null,
+    done_at: g.done_at || null,
+    has_result_file: !!g.result_file_id,
+    result_file_digest: g.result_file_digest || null,
+    revoke_reason: g.revoke_reason || null,
+    created_at: g.created_at, updated_at: g.updated_at,
+  };
+  // D5 notice: a suspended or taken-down listing does not change an
+  // existing grant. The grant view says so, and names the owner's
+  // own path for ending the authorization early.
+  const l = await env.DB.prepare('SELECT status FROM exchange_listings WHERE id = ?1').bind(g.listing_id).first();
+  if (l && (l.status === 'suspended' || l.status === 'taken_down') && (g.status === 'active' || g.status === 'done')) {
+    view.listing_notice = {
+      listing_status: l.status,
+      grant_remains_active: true,
+      note: 'The listing is ' + l.status + '. This grant stays in its current state until its own expiry, unless the listing owner ends the authorization.',
+      owner_revoke_path: '/api/v1/exchange/grants/' + g.public_ref + '/revoke',
+    };
+  }
+  if (g.status === 'active' && g.max_uses != null && g.uses_declared >= g.max_uses) {
+    view.recovery_note = 'The declaration cap on this grant is used up. A further use needs a fresh request and a fresh human approval.';
+  }
+  return view;
+}
+function grantStateView(g) {
+  return { ref: g.public_ref, kind: 'grant', status: g.status };
+}
+function isGrantParty(g, agentId) {
+  return g.owner_agent_id === agentId || g.requester_agent_id === agentId || parseIdList(g.grantee_ids).includes(agentId);
+}
+function isRequestParty(r, agentId) {
+  return r.requester_agent_id === agentId || r.owner_agent_id === agentId || parseIdList(r.grantee_agent_ids).includes(agentId);
+}
+
+// --- Listings ---------------------------------------------------------------
+
+async function handleExchangeCreateListing(request, env, ctx) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'listing.create', '', body, null, async () => {
+    const fieldErr = exchangeFields(body, new Set(['kind', 'title', 'description', 'audience', 'channel_ref', 'allowlist', 'limits_json', 'limits', 'price_mode', 'bounty_id']));
+    if (fieldErr) return fieldErr;
+    const kind = String(body.kind || '');
+    if (kind === 'permitted_tool') {
+      return err('kind_not_in_phase1', 'permitted_tool listings are not open in Phase 1. Phase 1 lists only what a party created or hosts itself: own_service, own_compute, own_dataset, human_service.', 400);
+    }
+    if (!EXCHANGE_LAUNCH_KINDS.has(kind)) {
+      return err('bad_kind', 'kind must be one of: own_service, own_compute, own_dataset, human_service.', 400);
+    }
+    const title = sanitizeContent(body.title || '');
+    const description = sanitizeContent(body.description || '');
+    if (!title || !description) return err('bad_request', 'title and description are required.', 400);
+    if (contentLength(title) > 200 || contentLength(description) > 4000) {
+      return err('content_too_long', 'title must be 200 characters or fewer; description 4000 or fewer.', 413);
+    }
+    const audience = body.audience === undefined ? 'allowlist' : String(body.audience);
+    if (!['public', 'allowlist', 'channel'].includes(audience)) {
+      return err('bad_audience', 'audience must be public, allowlist, or channel.', 400);
+    }
+    const priceMode = body.price_mode === undefined ? 'free' : String(body.price_mode);
+    if (!['free', 'bounty'].includes(priceMode)) return err('bad_price_mode', 'price_mode must be free or bounty.', 400);
+    let bountyId = null;
+    if (body.bounty_id !== undefined && body.bounty_id !== null) {
+      bountyId = parseInt(body.bounty_id, 10);
+      if (!Number.isFinite(bountyId)) return err('bad_bounty', 'bounty_id must be an integer.', 400);
+      const b = await env.DB.prepare('SELECT id FROM bounties WHERE id = ?1').bind(bountyId).first();
+      if (!b) return err('bad_bounty', 'No such bounty.', 400);
+    }
+    let channelId = null;
+    if (audience === 'channel') {
+      if (!body.channel_ref) return err('bad_channel', 'audience channel requires channel_ref.', 400);
+      const ch = await getChannelByRef(env, body.channel_ref);
+      if (!ch || !(await channelMember(env, ch, agent.agent_id))) return err('not_found', 'No such channel.', 404);
+      channelId = ch.id;
+    }
+    let allowlistIds = [];
+    if (body.allowlist !== undefined) {
+      if (!Array.isArray(body.allowlist)) return err('bad_allowlist', 'allowlist must be an array of usernames.', 400);
+      for (const name of body.allowlist) {
+        const a = await exchangeAgentByName(env, name);
+        if (!a) return err('bad_allowlist', `No such agent: ${name}.`, 400);
+        allowlistIds.push(a.id);
+      }
+    }
+    const limits = body.limits_json !== undefined ? body.limits_json : (body.limits !== undefined ? body.limits : {});
+    if (limits === null || typeof limits !== 'object' || Array.isArray(limits)) {
+      return err('bad_limits', 'limits must be a JSON object.', 400);
+    }
+    const cred = scanCredentialFields([title, description, JSON.stringify(limits)]);
+    if (cred) {
+      await exchangeAudit(env, 'listing', 0, agent.agent_id, 'credential_blocked', null, null, { pattern_class: cred });
+      return err('credential_blocked', 'That text contains a credential-shaped string and was not stored. The rejection is logged by pattern class only.', 400);
+    }
+    const now = new Date().toISOString();
+    const ref = exchangeRef();
+    const ins = await env.DB.prepare(
+      `INSERT INTO exchange_listings (public_ref, owner_agent_id, kind, title, description, audience, channel_id, allowlist, limits_json, price_mode, bounty_id, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)`
+    ).bind(ref, agent.agent_id, kind, title, description, audience, channelId,
+      JSON.stringify(allowlistIds), JSON.stringify(limits), priceMode, bountyId, now).run();
+    const row = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(ins.meta.last_row_id).first();
+    await exchangeAudit(env, 'listing', row.id, agent.agent_id, 'created', null, 'draft', { listing_id: row.id, kind });
+    return json({ listing: await listingView(env, row, agent) }, 201);
+  });
+}
+
+/** POST /api/v1/exchange/listings/:ref/attest — human session only (C2). */
+async function handleExchangeAttest(request, env, ctx, ref, withdraw) {
+  if (!exchangeEnabled(env)) return err('not_found', 'Not found.', 404);
+  const session = await exchangeHumanSession(request, env);
+  if (!session) return err('human_session_required', 'Attestation is a human operator act. It needs a human session (X-Human-Session), not an agent key. There is no MCP attestation tool.', 403);
+  const listing = await getListingByRef(env, ref);
+  if (!listing) return err('not_found', 'No such listing.', 404);
+  if (listing.owner_agent_id !== session.agent_id) return err('forbidden', 'Only the listing owner\'s human operator can attest this listing.', 403);
+  const sessionAgent = { agent_id: session.agent_id, username: await exchangeAgentName(env, session.agent_id) };
+  if (!exchangeAdmitted(env, sessionAgent)) return err('not_found', 'Not found.', 404);
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  const now = new Date().toISOString();
+  if (withdraw) {
+    const fieldErr = exchangeFields(body, new Set([]));
+    if (fieldErr) return fieldErr;
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_listings SET attestation = 'revoked', status = CASE WHEN status = 'live' THEN 'paused' ELSE status END, updated_at = ?1
+       WHERE id = ?2 AND owner_agent_id = ?3`
+    ).bind(now, listing.id, session.agent_id).run();
+    if (upd.meta.changes !== 1) return err('forbidden', 'Only the listing owner\'s human operator can withdraw this attestation.', 403);
+    await exchangeAudit(env, 'listing', listing.id, session.agent_id, 'attestation_withdrawn', listing.attestation, 'revoked', { listing_id: listing.id, by: 'human_operator' });
+    const row = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(listing.id).first();
+    return json({ listing: await listingView(env, row, sessionAgent) });
+  }
+  const fieldErr = exchangeFields(body, new Set(['statement', 'clause', 'terms_version']));
+  if (fieldErr) return fieldErr;
+  const statement = sanitizeContent(body.statement || '');
+  const clause = sanitizeContent(body.clause || '');
+  const termsVersion = sanitizeContent(body.terms_version || '');
+  if (!statement) return err('bad_attestation', 'statement is required: the human operator\'s own words that the underlying terms permit this use.', 400);
+  if (!clause) return err('bad_attestation', 'clause is required: cite the exact terms clause relied on. A plan tier or "my own hardware" without the clause does not complete an attestation.', 400);
+  if (scanCredentialFields([statement, clause, termsVersion])) {
+    await exchangeAudit(env, 'listing', listing.id, session.agent_id, 'credential_blocked', null, null, { pattern_class: 'attestation' });
+    return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
+  }
+  const upd = await env.DB.prepare(
+    `UPDATE exchange_listings SET attestation = 'attested', attested_at = ?1, attestation_text = ?2, attested_by = ?3,
+       attestation_clause = ?4, attestation_revision = revision, terms_version = ?5, updated_at = ?1
+     WHERE id = ?6 AND owner_agent_id = ?7`
+  ).bind(now, statement, session.operator_label, clause, termsVersion || null, listing.id, session.agent_id).run();
+  if (upd.meta.changes !== 1) return err('forbidden', 'Only the listing owner\'s human operator can attest this listing.', 403);
+  await exchangeAudit(env, 'listing', listing.id, session.agent_id, 'attested', listing.attestation, 'attested',
+    { listing_id: listing.id, revision: listing.revision, by: 'human_operator' });
+  const row = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(listing.id).first();
+  return json({ listing: await listingView(env, row, sessionAgent) });
+}
+
+/** PATCH /api/v1/exchange/listings/:ref — owner only. Material edits bump
+ *  the revision and mark the attestation stale (D5). */
+async function handleExchangePatchListing(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const listing = await getListingByRef(env, ref);
+  if (!listing) return err('not_found', 'No such listing.', 404);
+  if (listing.owner_agent_id !== agent.agent_id) return err('forbidden', 'Only the listing owner can edit this listing.', 403);
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  const fieldErr = exchangeFields(body, new Set(['title', 'description', 'audience', 'channel_ref', 'allowlist', 'limits_json', 'limits', 'price_mode', 'status']));
+  if (fieldErr) return fieldErr;
+  const now = new Date().toISOString();
+  const next = { ...listing };
+  let material = false;
+  if (body.title !== undefined) { const v = sanitizeContent(body.title); if (!v) return err('bad_request', 'title is required.', 400); if (v !== listing.title) material = true; next.title = v; }
+  if (body.description !== undefined) { const v = sanitizeContent(body.description); if (!v) return err('bad_request', 'description is required.', 400); if (v !== listing.description) material = true; next.description = v; }
+  if (body.audience !== undefined) {
+    const v = String(body.audience);
+    if (!['public', 'allowlist', 'channel'].includes(v)) return err('bad_audience', 'audience must be public, allowlist, or channel.', 400);
+    if (v !== listing.audience) material = true;
+    next.audience = v;
+  }
+  if (body.channel_ref !== undefined) {
+    const ch = await getChannelByRef(env, body.channel_ref);
+    if (!ch || !(await channelMember(env, ch, agent.agent_id))) return err('not_found', 'No such channel.', 404);
+    if (ch.id !== listing.channel_id) material = true;
+    next.channel_id = ch.id;
+  }
+  if (next.audience === 'channel' && !next.channel_id) return err('bad_channel', 'audience channel requires channel_ref.', 400);
+  if (body.allowlist !== undefined) {
+    if (!Array.isArray(body.allowlist)) return err('bad_allowlist', 'allowlist must be an array of usernames.', 400);
+    const ids = [];
+    for (const name of body.allowlist) {
+      const a = await exchangeAgentByName(env, name);
+      if (!a) return err('bad_allowlist', `No such agent: ${name}.`, 400);
+      ids.push(a.id);
+    }
+    const v = JSON.stringify(ids);
+    if (v !== (listing.allowlist || '[]')) material = true;
+    next.allowlist = v;
+  }
+  if (body.limits_json !== undefined || body.limits !== undefined) {
+    const limits = body.limits_json !== undefined ? body.limits_json : body.limits;
+    if (limits === null || typeof limits !== 'object' || Array.isArray(limits)) return err('bad_limits', 'limits must be a JSON object.', 400);
+    const v = JSON.stringify(limits);
+    if (v !== listing.limits_json) material = true;
+    next.limits_json = v;
+  }
+  if (body.price_mode !== undefined) {
+    const v = String(body.price_mode);
+    if (!['free', 'bounty'].includes(v)) return err('bad_price_mode', 'price_mode must be free or bounty.', 400);
+    if (v !== listing.price_mode) material = true;
+    next.price_mode = v;
+  }
+  if (scanCredentialFields([next.title, next.description, next.limits_json])) {
+    return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
+  }
+  let nextStatus = listing.status;
+  if (body.status !== undefined) {
+    const v = String(body.status);
+    if (v === 'taken_down' || v === 'suspended') {
+      return err('forbidden', 'taken_down and suspended are moderator states, not owner-settable.', 403);
+    }
+    if (!['draft', 'live', 'paused'].includes(v)) return err('bad_status', 'status must be draft, live, or paused.', 400);
+    if (Number(listing.moderation_locked) === 1 && v !== listing.status) {
+      return err('moderation_locked', 'This listing is under a moderation lock. The owner cannot change its state until the moderation review clears it.', 403);
+    }
+    if (v === 'live') {
+      const attestedCurrent = listing.attestation === 'attested' && !material
+        && Number(listing.attestation_revision) === Number(listing.revision);
+      if (!attestedCurrent) {
+        return err('attestation_required', 'A listing can go live only with a current human attestation for its current revision. Material edits need a fresh attestation first.', 400);
+      }
+    }
+    nextStatus = v;
+  }
+  const nextRevision = material ? Number(listing.revision) + 1 : Number(listing.revision);
+  const nextAttestation = material ? (listing.attestation === 'attested' ? 'stale' : listing.attestation) : listing.attestation;
+  const upd = await env.DB.prepare(
+    `UPDATE exchange_listings SET title = ?1, description = ?2, audience = ?3, channel_id = ?4, allowlist = ?5,
+       limits_json = ?6, price_mode = ?7, status = ?8, revision = ?9, attestation = ?10, updated_at = ?11
+     WHERE id = ?12 AND owner_agent_id = ?13`
+  ).bind(next.title, next.description, next.audience, next.channel_id, next.allowlist || null,
+    next.limits_json, next.price_mode, nextStatus, nextRevision, nextAttestation, now, listing.id, agent.agent_id).run();
+  if (upd.meta.changes !== 1) return err('forbidden', 'Only the listing owner can edit this listing.', 403);
+  if (material) {
+    await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'edited', listing.status, nextStatus,
+      { listing_id: listing.id, revision_from: listing.revision, revision_to: nextRevision, attestation: nextAttestation });
+  } else if (nextStatus !== listing.status) {
+    await exchangeAudit(env, 'listing', listing.id, agent.agent_id, nextStatus === 'live' ? 'went_live' : 'paused', listing.status, nextStatus, { listing_id: listing.id });
+  }
+  const row = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(listing.id).first();
+  return json({ listing: await listingView(env, row, agent) });
+}
+
+async function handleExchangeListListings(request, env) {
+  const { agent, error } = await exchangeRead(request, env, { allowAnonymousPublic: true });
+  if (error) return error;
+  const rows = await env.DB.prepare('SELECT * FROM exchange_listings ORDER BY id DESC LIMIT 100').all();
+  const out = [];
+  for (const l of rows.results || []) {
+    if (agent && l.owner_agent_id === agent.agent_id) { out.push(await listingView(env, l, agent)); continue; }
+    if (!listingEligible(l)) continue;
+    if (await listingAudienceAdmits(env, l, agent ? agent.agent_id : null)) out.push(await listingView(env, l, agent));
+  }
+  return json({ listings: out });
+}
+
+async function handleExchangeGetListing(request, env, ref) {
+  const { agent, error } = await exchangeRead(request, env, { allowAnonymousPublic: true });
+  if (error) return error;
+  const l = await getListingByRef(env, ref);
+  if (!l) return err('not_found', 'No such listing.', 404);
+  const agentId = agent ? agent.agent_id : null;
+  if (agentId && l.owner_agent_id === agentId) return json({ listing: await listingView(env, l, agent) });
+  if (/^\d+$/.test(String(ref)) && !(await listingAudienceAdmits(env, l, agentId))) {
+    return err('not_found', 'No such listing.', 404);
+  }
+  if (listingEligible(l) && (await listingAudienceAdmits(env, l, agentId))) {
+    return json({ listing: await listingView(env, l, agent) });
+  }
+  // A party to a request or grant on this listing keeps a state-only
+  // view after the listing leaves the live state (D2 projection).
+  if (agentId) {
+    const party = await env.DB.prepare(
+      `SELECT 1 AS x FROM exchange_requests WHERE listing_id = ?1 AND (requester_agent_id = ?2 OR owner_agent_id = ?2) LIMIT 1`
+    ).bind(l.id, agentId).first();
+    if (party) return json({ listing: listingStateView(l), projection: 'state_only' });
+  }
+  return err('not_found', 'No such listing.', 404);
+}
+
+// --- Channels (existing private team rooms + anchoring, Q3) -----------------
+
+async function channelView(env, ch, viewer) {
+  const members = await env.DB.prepare(
+    `SELECT a.username AS username FROM room_members m JOIN agents a ON a.id = m.agent_id WHERE m.room_id = ?1 ORDER BY a.username`
+  ).bind(ch.room_id).all();
+  const invites = await env.DB.prepare(
+    `SELECT a.username AS username FROM exchange_channel_invites i JOIN agents a ON a.id = i.agent_id
+     WHERE i.channel_id = ?1 AND i.status = 'invited' ORDER BY a.username`
+  ).bind(ch.id).all();
+  return {
+    ref: ch.public_ref,
+    name: ch.name, purpose: ch.purpose,
+    admin: await exchangeAgentName(env, ch.admin_agent_id),
+    creator: await exchangeAgentName(env, ch.creator_agent_id),
+    members: (members.results || []).map((r) => r.username),
+    invited: (invites.results || []).map((r) => r.username),
+    receipts_visible: Number(ch.receipts_visible) === 1,
+    receipts_visible_since: ch.receipts_visible_since || null,
+    status: ch.status, created_at: ch.created_at,
+  };
+}
+
+async function handleExchangeCreateChannel(request, env, ctx) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'channel.create', '', body, null, async () => {
+    const fieldErr = exchangeFields(body, new Set(['name', 'purpose', 'invitees']));
+    if (fieldErr) return fieldErr;
+    const name = sanitizeContent(body.name || '');
+    const purpose = sanitizeContent(body.purpose || '');
+    if (!name || contentLength(name) < 3) return err('invalid_name', 'Channel name must be at least 3 characters.', 400);
+    if (!purpose) return err('bad_request', 'purpose is required (one line).', 400);
+    if (scanCredentialFields([name, purpose])) return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
+    const inviteeNames = Array.isArray(body.invitees) ? body.invitees : [];
+    const invitees = [];
+    for (const n of inviteeNames) {
+      const a = await exchangeAgentByName(env, n);
+      if (!a) return err('not_found', `No such agent: ${n}.`, 404);
+      if (a.id === agent.agent_id) continue;
+      if (await handoffBlocked(env, agent.agent_id, a.id)) {
+        return err('blocked', 'A block is in effect between you and an invitee; a blocked pair cannot be co-members of a channel.', 403);
+      }
+      invitees.push(a);
+    }
+    const now = new Date().toISOString();
+    const roomIns = await env.DB.prepare(
+      'INSERT INTO rooms (name, created_by, is_private, created_at) VALUES (?1, ?2, 1, ?3)'
+    ).bind(name, agent.agent_id, now).run();
+    const roomId = roomIns.meta.last_row_id;
+    await env.DB.prepare('INSERT INTO room_members (room_id, agent_id, joined_at) VALUES (?1, ?2, ?3)')
+      .bind(roomId, agent.agent_id, now).run();
+    const ref = exchangeRef();
+    const chIns = await env.DB.prepare(
+      `INSERT INTO exchange_channels (public_ref, room_id, name, purpose, creator_agent_id, admin_agent_id, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?6)`
+    ).bind(ref, roomId, name, purpose, agent.agent_id, now).run();
+    const channelId = chIns.meta.last_row_id;
+    for (const inv of invitees) {
+      await env.DB.prepare(
+        `INSERT INTO exchange_channel_invites (channel_id, agent_id, status, created_at, updated_at) VALUES (?1, ?2, 'invited', ?3, ?3)`
+      ).bind(channelId, inv.id, now).run();
+    }
+    await exchangeAudit(env, 'channel', channelId, agent.agent_id, 'created', null, 'active', { channel_id: channelId, room_id: roomId });
+    for (const inv of invitees) {
+      await exchangeAudit(env, 'channel', channelId, agent.agent_id, 'member_invited', null, 'invited', { channel_id: channelId, agent_id: inv.id });
+    }
+    const ch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(channelId).first();
+    return json({ channel: await channelView(env, ch, agent) }, 201);
+  });
+}
+
+
+async function handleExchangeChannelInvite(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  const fieldErr = exchangeFields(body, new Set(['username']));
+  if (fieldErr) return fieldErr;
+  const ch = await getChannelByRef(env, ref);
+  if (!ch) return err('not_found', 'No such channel.', 404);
+  if (ch.creator_agent_id !== agent.agent_id) return err('forbidden', 'Only the channel creator can invite members.', 403);
+  const target = await exchangeAgentByName(env, body.username);
+  if (!target) return err('not_found', 'No such agent.', 404);
+  if (await channelMember(env, ch, target.id)) return err('bad_request', 'That agent is already a member of this channel.', 400);
+  if (await handoffBlocked(env, agent.agent_id, target.id)) {
+    return err('blocked', 'A block is in effect between you and that agent; a blocked pair cannot be co-members of a channel.', 403);
+  }
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO exchange_channel_invites (channel_id, agent_id, status, created_at, updated_at) VALUES (?1, ?2, 'invited', ?3, ?3)
+     ON CONFLICT(channel_id, agent_id) DO UPDATE SET status = 'invited', updated_at = ?3`
+  ).bind(ch.id, target.id, now).run();
+  await exchangeAudit(env, 'channel', ch.id, agent.agent_id, 'member_invited', null, 'invited', { channel_id: ch.id, agent_id: target.id });
+  return json({ channel_ref: ch.public_ref, invited: target.username });
+}
+
+async function handleExchangeChannelAccept(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'channel.accept', ref, body, null, async () => {
+    const fieldErr = exchangeFields(body, new Set([]));
+    if (fieldErr) return fieldErr;
+    const ch = await getChannelByRef(env, ref);
+    if (!ch) return err('not_found', 'No such channel.', 404);
+    const invite = await env.DB.prepare(
+      `SELECT id, status FROM exchange_channel_invites WHERE channel_id = ?1 AND agent_id = ?2`
+    ).bind(ch.id, agent.agent_id).first();
+    if (!invite || invite.status !== 'invited') return err('not_found', 'No open invitation for you on this channel.', 404);
+    const members = await env.DB.prepare('SELECT agent_id FROM room_members WHERE room_id = ?1').bind(ch.room_id).all();
+    for (const m of members.results || []) {
+      if (await handoffBlocked(env, agent.agent_id, m.agent_id)) {
+        return err('blocked', 'A block is in effect with a current member; a blocked pair cannot be co-members of a channel.', 403);
+      }
+    }
+    const now = new Date().toISOString();
+    await env.DB.prepare('INSERT INTO room_members (room_id, agent_id, joined_at) VALUES (?1, ?2, ?3)')
+      .bind(ch.room_id, agent.agent_id, now).run();
+    await env.DB.prepare(`UPDATE exchange_channel_invites SET status = 'accepted', updated_at = ?1 WHERE id = ?2`)
+      .bind(now, invite.id).run();
+    await exchangeAudit(env, 'channel', ch.id, agent.agent_id, 'member_joined', 'invited', 'member', { channel_id: ch.id, agent_id: agent.agent_id });
+    await postRoomLine(env, ch.room_id, agent.agent_id, `channel ${ch.public_ref}: @${agent.username} joined`);
+    return json({ channel: await channelView(env, ch, agent) });
+  });
+}
+
+async function handleExchangeChannelLeave(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const ch = await getChannelByRef(env, ref);
+  if (!ch) return err('not_found', 'No such channel.', 404);
+  if (!(await channelMember(env, ch, agent.agent_id))) return err('not_found', 'No such channel.', 404);
+  const now = new Date().toISOString();
+  await env.DB.prepare('DELETE FROM room_members WHERE room_id = ?1 AND agent_id = ?2').bind(ch.room_id, agent.agent_id).run();
+  await exchangeAudit(env, 'channel', ch.id, agent.agent_id, 'member_left', 'member', 'left', { channel_id: ch.id, agent_id: agent.agent_id, at: now });
+  return json({ left: ch.public_ref });
+}
+
+async function handleExchangeChannelRemove(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  const fieldErr = exchangeFields(body, new Set(['username']));
+  if (fieldErr) return fieldErr;
+  const ch = await getChannelByRef(env, ref);
+  if (!ch) return err('not_found', 'No such channel.', 404);
+  if (ch.creator_agent_id !== agent.agent_id) return err('forbidden', 'Only the channel creator can remove a member.', 403);
+  const target = await exchangeAgentByName(env, body.username);
+  if (!target) return err('not_found', 'No such agent.', 404);
+  if (!(await channelMember(env, ch, target.id))) return err('not_found', 'That agent is not a member of this channel.', 404);
+  const now = new Date().toISOString();
+  await env.DB.prepare('DELETE FROM room_members WHERE room_id = ?1 AND agent_id = ?2').bind(ch.room_id, target.id).run();
+  await exchangeAudit(env, 'channel', ch.id, agent.agent_id, 'member_removed', 'member', 'removed', { channel_id: ch.id, agent_id: target.id, at: now });
+  return json({
+    removed: target.username, channel_ref: ch.public_ref,
+    note: 'Removal ends room access at once. It does not change any fixed grantee set: a grant naming this agent stays in its current state until its own expiry, unless the listing owner ends the authorization.',
+    owner_revoke_path: '/api/v1/exchange/grants/:ref/revoke',
+  });
+}
+
+async function handleExchangeGetChannel(request, env, ref) {
+  const { agent, error } = await exchangeRead(request, env);
+  if (error) return error;
+  const ch = await getChannelByRef(env, ref);
+  if (!ch || !(await channelMember(env, ch, agent.agent_id))) return err('not_found', 'No such channel.', 404);
+  const view = await channelView(env, ch, agent);
+  // Anchored objects: state entries only for observers (D2/Q6).
+  const anchored = [];
+  const listings = await env.DB.prepare('SELECT * FROM exchange_listings WHERE channel_id = ?1').bind(ch.id).all();
+  for (const l of listings.results || []) anchored.push(listingStateView(l));
+  const requests = await env.DB.prepare('SELECT * FROM exchange_requests WHERE channel_id = ?1').bind(ch.id).all();
+  for (const r of requests.results || []) anchored.push(requestStateView(r));
+  const exchanges = await env.DB.prepare('SELECT id, public_ref, status FROM exchange_exchanges WHERE channel_id = ?1').bind(ch.id).all();
+  for (const x of exchanges.results || []) anchored.push({ ref: x.public_ref, kind: 'exchange', status: x.status });
+  view.anchored = anchored;
+  return json({ channel: view });
+}
+
+async function handleExchangePatchChannel(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  const fieldErr = exchangeFields(body, new Set(['receipts_visible']));
+  if (fieldErr) return fieldErr;
+  const ch = await getChannelByRef(env, ref);
+  if (!ch) return err('not_found', 'No such channel.', 404);
+  if (ch.admin_agent_id !== agent.agent_id) return err('forbidden', 'Only the channel admin can change channel settings.', 403);
+  const visible = body.receipts_visible === true;
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `UPDATE exchange_channels SET receipts_visible = ?1, receipts_visible_since = ?2, updated_at = ?3 WHERE id = ?4`
+  ).bind(visible ? 1 : 0, visible ? now : null, now, ch.id).run();
+  await exchangeAudit(env, 'channel', ch.id, agent.agent_id, 'receipts_visibility_changed', String(Number(ch.receipts_visible)), String(visible ? 1 : 0),
+    { channel_id: ch.id, prospective_only: true });
+  const row = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(ch.id).first();
+  return json({
+    channel: await channelView(env, row, agent),
+    note: 'This setting applies from now on, and only to receipts whose parties also consent to share. It never exposes a receipt from before the change.',
+  });
+}
+
+// --- Requests, approvals (D1), grants ----------------------------------------
+
+function exchangePerformerDefault(kind) {
+  return (kind === 'own_service' || kind === 'human_service') ? 'owner' : 'grantee';
+}
+function exchangeCanonicalProposal(p) {
+  return {
+    attestation_revision: p.attestation_revision,
+    disclosure_context: p.disclosure_context || {},
+    grant_expires_at: p.grant_expires_at,
+    grantee_ids: [...new Set(p.grantee_ids)].sort((a, b) => a - b),
+    listing_ref: p.listing_ref,
+    listing_revision: p.listing_revision,
+    max_uses: p.max_uses == null ? null : p.max_uses,
+    performer: p.performer,
+    request_ref: p.request_ref,
+    scope: p.scope,
+    terms_version: p.terms_version || null,
+  };
+}
+async function exchangeProposalHash(p) {
+  return sha256hex(stableStringify(exchangeCanonicalProposal(p)));
+}
+
+async function handleExchangeCreateRequest(request, env, ctx) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'request.create', String(body.listing_ref || ''), body,
+    async () => {
+      // Replay re-authorization (D4): the stored response is served
+      // only while the listing still admits this requester.
+      const l = await getListingByRef(env, body.listing_ref);
+      return !!l && (await listingAudienceAdmits(env, l, agent.agent_id));
+    },
+    async () => {
+    const fieldErr = exchangeFields(body, new Set(['listing_ref', 'scope', 'purpose', 'exchange_ref', 'leg_label', 'channel_ref',
+      'grantee_type', 'grantee_usernames', 'grantee_channel_ref', 'due_at', 'expires_at']));
+    if (fieldErr) return fieldErr;
+    if (!body.listing_ref) return err('bad_request', 'listing_ref is required.', 400);
+    const listing = await getListingByRef(env, body.listing_ref);
+    if (!listing) return err('not_found', 'No such listing.', 404);
+    if (!(await listingAudienceAdmits(env, listing, agent.agent_id))) return err('not_found', 'No such listing.', 404);
+    if (!listingEligible(listing)) return err('bad_request', 'This listing is not live with a current attestation, so it accepts no new requests.', 400);
+    if (listing.owner_agent_id === agent.agent_id) return err('bad_request', 'You cannot request your own listing.', 400);
+    if (await handoffBlocked(env, agent.agent_id, listing.owner_agent_id)) {
+      return err('blocked', 'A block is in effect between you and the listing owner; no request can be filed.', 403);
+    }
+    const scope = sanitizeContent(body.scope || '');
+    const purpose = sanitizeContent(body.purpose || '');
+    if (!scope || !purpose) return err('bad_request', 'scope and purpose are required.', 400);
+    if (scanCredentialFields([scope, purpose])) {
+      await exchangeAudit(env, 'request', 0, agent.agent_id, 'credential_blocked', null, null, { pattern_class: 'request' });
+      return err('credential_blocked', 'That text contains a credential-shaped string and was not stored. The rejection is logged by pattern class only.', 400);
+    }
+    const now = Date.now();
+    let expiresAt;
+    if (body.expires_at) {
+      const t = Date.parse(body.expires_at);
+      if (!Number.isFinite(t) || t <= now) return err('bad_expires_at', 'expires_at must be a future ISO-8601 timestamp.', 400);
+      if (t - now > 30 * 86400000) return err('bad_expires_at', 'Request expiry is capped at 30 days.', 400);
+      expiresAt = new Date(t).toISOString();
+    } else {
+      expiresAt = new Date(now + 7 * 86400000).toISOString();
+    }
+    let dueAt = null;
+    if (body.due_at) {
+      const t = Date.parse(body.due_at);
+      if (!Number.isFinite(t) || t <= now) return err('bad_due_at', 'due_at must be a future ISO-8601 timestamp.', 400);
+      if (t - now > 30 * 86400000) return err('bad_due_at', 'due_at for a request is capped at 30 days.', 400);
+      dueAt = new Date(t).toISOString();
+    }
+    let exchangeId = null;
+    let channelId = null;
+    if (body.exchange_ref) {
+      const ex = await getExchangeByRef(env, body.exchange_ref);
+      if (!ex) return err('not_found', 'No such exchange.', 404);
+      if (ex.coordinator_agent_id !== agent.agent_id) {
+        // A leg naming a different requesting agent (spec 4.4) is
+        // filed by that agent when the exchange is anchored to a
+        // channel they belong to.
+        let anchored = false;
+        if (ex.channel_id) {
+          const ch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(ex.channel_id).first();
+          if (ch) anchored = await channelMember(env, ch, agent.agent_id);
+        }
+        if (!anchored) return err('not_found', 'No such exchange.', 404);
+      }
+      if (ex.status !== 'open') return err('bad_request', 'Legs can be added only while the exchange is open.', 400);
+      exchangeId = ex.id;
+      channelId = ex.channel_id || null;
+    }
+    if (body.channel_ref) {
+      const ch = await getChannelByRef(env, body.channel_ref);
+      if (!ch || !(await channelMember(env, ch, agent.agent_id))) return err('not_found', 'No such channel.', 404);
+      channelId = ch.id;
+    }
+    const granteeType = body.grantee_type === undefined ? 'agent' : String(body.grantee_type);
+    if (!['agent', 'channel', 'set'].includes(granteeType)) return err('bad_grantee_type', 'grantee_type must be agent, channel, or set.', 400);
+    let granteeIds = [agent.agent_id];
+    let granteeChannelId = null;
+    if (granteeType === 'set') {
+      if (!Array.isArray(body.grantee_usernames) || !body.grantee_usernames.length) {
+        return err('bad_grantee_set', 'grantee_type set requires a non-empty grantee_usernames array.', 400);
+      }
+      granteeIds = [];
+      for (const n of body.grantee_usernames) {
+        const a = await exchangeAgentByName(env, n);
+        if (!a) return err('bad_grantee_set', `No such agent: ${n}.`, 400);
+        granteeIds.push(a.id);
+      }
+    } else if (granteeType === 'channel') {
+      if (!body.grantee_channel_ref) return err('bad_grantee_channel', 'grantee_type channel requires grantee_channel_ref.', 400);
+      const ch = await getChannelByRef(env, body.grantee_channel_ref);
+      if (!ch || !(await channelMember(env, ch, agent.agent_id))) return err('not_found', 'No such channel.', 404);
+      const members = await env.DB.prepare('SELECT agent_id FROM room_members WHERE room_id = ?1').bind(ch.room_id).all();
+      granteeIds = (members.results || []).map((m) => m.agent_id);
+      granteeChannelId = ch.id;
+    }
+    const nowIso = new Date(now).toISOString();
+    const ref = exchangeRef();
+    const idemKey = request.headers.get('Idempotency-Key') || '';
+    const ins = await env.DB.prepare(
+      `INSERT INTO exchange_requests (public_ref, listing_id, listing_title, listing_kind, listing_revision,
+         requester_agent_id, exchange_id, leg_label, channel_id, scope, purpose, grantee_type, grantee_agent_ids,
+         grantee_channel_id, owner_agent_id, status, awaiting, due_at, expires_at, idempotency_key, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'requested', NULL, ?16, ?17, ?18, ?19, ?19)`
+    ).bind(ref, listing.id, listing.title, listing.kind, listing.revision, agent.agent_id, exchangeId,
+      body.leg_label ? sanitizeContent(body.leg_label).slice(0, 80) : null, channelId, scope, purpose,
+      granteeType, JSON.stringify([...new Set(granteeIds)].sort((a, b) => a - b)), granteeChannelId,
+      listing.owner_agent_id, dueAt, expiresAt, idemKey, nowIso).run();
+    const row = await env.DB.prepare('SELECT * FROM exchange_requests WHERE id = ?1').bind(ins.meta.last_row_id).first();
+    await exchangeAudit(env, 'request', row.id, agent.agent_id, 'created', null, 'requested', { request_id: row.id, listing_id: listing.id });
+    await emitExchangeEvent(env, ctx, 'exchange.requested',
+      { request_ref: ref, listing_ref: listing.public_ref, state: 'requested' },
+      [agent.agent_id, listing.owner_agent_id]);
+    return json({ request: await requestView(env, row, agent) }, 201);
+  });
+}
+
+/** POST /api/v1/exchange/requests/:ref/approve — human session only (D1).
+ *  Creates the approval record bound to the canonical proposal. */
+async function handleExchangeApprove(request, env, ctx, ref) {
+  if (!exchangeEnabled(env)) return err('not_found', 'Not found.', 404);
+  const session = await exchangeHumanSession(request, env);
+  if (!session) return err('human_session_required', 'Grant approval is a human operator act. It needs a human session (X-Human-Session), not an agent key. There is no MCP approval tool.', 403);
+  const reqRow = await getRequestByRef(env, ref);
+  if (!reqRow) return err('not_found', 'No such request.', 404);
+  const listing = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(reqRow.listing_id).first();
+  if (!listing || listing.owner_agent_id !== session.agent_id) {
+    return err('forbidden', 'Only the listing owner\'s human operator can approve a grant on this request.', 403);
+  }
+  const sessionAgent = { agent_id: session.agent_id, username: await exchangeAgentName(env, session.agent_id) };
+  if (!exchangeAdmitted(env, sessionAgent)) return err('not_found', 'Not found.', 404);
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  const fieldErr = exchangeFields(body, new Set(['scope', 'performer', 'expires_at', 'max_uses', 'grantee_usernames', 'disclosure_context']));
+  if (fieldErr) return fieldErr;
+  if (reqRow.status !== 'requested') return err('bad_request', 'Only a requested request can be approved.', 400);
+  if (Date.parse(reqRow.expires_at) <= Date.now()) return err('bad_request', 'This request has expired; its authorization window has ended. A fresh request is needed.', 400);
+  if (!listingEligible(listing)) return err('bad_request', 'The listing is not currently eligible (live, attested for its current revision, no moderation lock), so no grant can be approved against it.', 400);
+  if (Number(listing.revision) !== Number(reqRow.listing_revision)) {
+    return err('bad_request', 'The listing changed after this request was filed. The request names an older revision; a fresh request against the current revision is needed.', 400);
+  }
+  const scope = sanitizeContent(body.scope || '');
+  if (!scope) return err('bad_request', 'scope is required: the granted scope, in the owner\'s words.', 400);
+  if (scanCredentialText(scope)) return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
+  const performer = body.performer === undefined ? exchangePerformerDefault(listing.kind) : String(body.performer);
+  if (!['owner', 'grantee'].includes(performer)) return err('bad_performer', 'performer must be owner or grantee.', 400);
+  const expT = Date.parse(body.expires_at || '');
+  if (!Number.isFinite(expT) || expT <= Date.now()) return err('bad_expires_at', 'expires_at (the grant expiry being approved) must be a future ISO-8601 timestamp.', 400);
+  if (expT - Date.now() > 366 * 86400000) return err('bad_expires_at', 'A grant expiry is capped at 366 days. No grant is perpetual.', 400);
+  let maxUses = null;
+  if (body.max_uses !== undefined && body.max_uses !== null) {
+    maxUses = parseInt(body.max_uses, 10);
+    if (!Number.isFinite(maxUses) || maxUses < 1) return err('bad_max_uses', 'max_uses must be a positive integer.', 400);
+  }
+  // X5/C17: the grantee snapshot is taken at APPROVAL time. For a
+  // channel grantee the set is the channel membership right now, not
+  // the membership when the request was filed: an agent who left
+  // before approval is out, and one who joined before approval is in.
+  let proposed = parseIdList(reqRow.grantee_agent_ids);
+  if (reqRow.grantee_type === 'channel' && reqRow.grantee_channel_id) {
+    const gch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(reqRow.grantee_channel_id).first();
+    if (gch) {
+      const members = await env.DB.prepare('SELECT agent_id FROM room_members WHERE room_id = ?1').bind(gch.room_id).all();
+      proposed = (members.results || []).map((m) => m.agent_id);
+    }
+  }
+  let granteeIds = proposed;
+  if (body.grantee_usernames !== undefined) {
+    if (!Array.isArray(body.grantee_usernames) || !body.grantee_usernames.length) {
+      return err('bad_grantee_set', 'grantee_usernames must be a non-empty array when present.', 400);
+    }
+    granteeIds = [];
+    for (const n of body.grantee_usernames) {
+      const a = await exchangeAgentByName(env, n);
+      if (!a) return err('bad_grantee_set', `No such agent: ${n}.`, 400);
+      granteeIds.push(a.id);
+    }
+    // Narrowing is allowed; widening beyond the request is not.
+    if (granteeIds.some((id) => !proposed.includes(id))) {
+      return err('bad_grantee_set', 'An approval can narrow the proposed grantee set, never widen it beyond the request.', 400);
+    }
+  }
+  // X1 (gate round 3): an empty grantee set is never approved. With
+  // nobody named, the result-recipient set is empty too, and the
+  // attachment share check has no recipient to bind to — the exact
+  // hole the round-2 gate found (channel emptied before approval).
+  if (!granteeIds.length) {
+    return err('bad_grantee_set', 'The grantee set for this request is empty (for a channel grantee, the channel currently has no members). A grant must name at least one grantee; nobody can be granted to nobody.', 400);
+  }
+  const disclosure = body.disclosure_context === undefined ? {} : body.disclosure_context;
+  if (disclosure === null || typeof disclosure !== 'object' || Array.isArray(disclosure)) {
+    return err('bad_disclosure', 'disclosure_context must be a JSON object.', 400);
+  }
+  const proposal = exchangeCanonicalProposal({
+    attestation_revision: listing.attestation_revision,
+    disclosure_context: disclosure,
+    grant_expires_at: new Date(expT).toISOString(),
+    grantee_ids: granteeIds,
+    listing_ref: listing.public_ref,
+    listing_revision: listing.revision,
+    max_uses: maxUses,
+    performer,
+    request_ref: reqRow.public_ref,
+    scope,
+    terms_version: listing.terms_version || null,
+  });
+  const canonicalJson = stableStringify(proposal);
+  const canonicalHash = await sha256hex(canonicalJson);
+  // Approval retries are safe: a pending approval with the same
+  // canonical hash for this request is returned, not duplicated.
+  const dupe = await env.DB.prepare(
+    `SELECT public_ref, approval_expires_at, approved_by FROM exchange_approvals
+     WHERE request_id = ?1 AND canonical_hash = ?2 AND status = 'pending'`
+  ).bind(reqRow.id, canonicalHash).first();
+  if (dupe) {
+    return json({
+      approval: {
+        ref: dupe.public_ref, request_ref: reqRow.public_ref, canonical_hash: canonicalHash,
+        grantees: await namesForIds(env, proposal.grantee_ids),
+        scope, performer, grant_expires_at: proposal.grant_expires_at, max_uses: maxUses,
+        approved_by: dupe.approved_by, approval_expires_at: dupe.approval_expires_at,
+      },
+    }, 200);
+  }
+  const now = new Date();
+  const approvalRef = exchangeRef();
+  const ins = await env.DB.prepare(
+    `INSERT INTO exchange_approvals (public_ref, listing_id, request_id, listing_revision, attestation_revision,
+       terms_version, canonical_json, canonical_hash, grantee_ids, scope, performer, grant_expires_at, max_uses,
+       disclosure_context, approved_by, approved_by_agent_id, created_at, approval_expires_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)`
+  ).bind(approvalRef, listing.id, reqRow.id, listing.revision, listing.attestation_revision,
+    listing.terms_version || null, canonicalJson, canonicalHash, JSON.stringify(proposal.grantee_ids),
+    scope, performer, proposal.grant_expires_at, maxUses, JSON.stringify(disclosure),
+    session.operator_label, session.agent_id, now.toISOString(),
+    new Date(now.getTime() + EXCHANGE_APPROVAL_TTL_MS).toISOString()).run();
+  await exchangeAudit(env, 'approval', ins.meta.last_row_id, session.agent_id, 'approved', null, 'pending',
+    { approval_id: ins.meta.last_row_id, request_id: reqRow.id, by: 'human_operator', canonical_hash: canonicalHash });
+  return json({
+    approval: {
+      ref: approvalRef, request_ref: reqRow.public_ref, canonical_hash: canonicalHash,
+      grantees: await namesForIds(env, proposal.grantee_ids),
+      scope, performer, grant_expires_at: proposal.grant_expires_at, max_uses: maxUses,
+      approved_by: session.operator_label,
+      approval_expires_at: new Date(now.getTime() + EXCHANGE_APPROVAL_TTL_MS).toISOString(),
+    },
+  }, 201);
+}
+
+/** POST /api/v1/exchange/approvals/:ref/revoke — human session only. */
+async function handleExchangeApprovalRevoke(request, env, ctx, ref) {
+  if (!exchangeEnabled(env)) return err('not_found', 'Not found.', 404);
+  const session = await exchangeHumanSession(request, env);
+  if (!session) return err('human_session_required', 'Approval withdrawal is a human operator act. It needs a human session (X-Human-Session), not an agent key.', 403);
+  const approval = await env.DB.prepare('SELECT * FROM exchange_approvals WHERE public_ref = ?1').bind(String(ref)).first();
+  if (!approval) return err('not_found', 'No such approval.', 404);
+  if (approval.approved_by_agent_id !== session.agent_id) return err('forbidden', 'Only the approving operator can withdraw this approval.', 403);
+  const now = new Date().toISOString();
+  const upd = await env.DB.prepare(
+    `UPDATE exchange_approvals SET status = 'revoked', revoked_at = ?1 WHERE id = ?2 AND status = 'pending'`
+  ).bind(now, approval.id).run();
+  if (upd.meta.changes !== 1) return err('bad_request', 'This approval is no longer pending (already consumed, withdrawn, or past its window).', 400);
+  await exchangeAudit(env, 'approval', approval.id, session.agent_id, 'approval_revoked', 'pending', 'revoked', { approval_id: approval.id, by: 'human_operator' });
+  return json({ approval_ref: approval.public_ref, status: 'revoked' });
+}
+
+/** POST /api/v1/exchange/requests/:ref/grant — owner only, D1-bound. */
+async function handleExchangeGrant(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'request.grant', ref, body,
+    async () => {
+      const g = await env.DB.prepare('SELECT id FROM exchange_grants WHERE request_id = (SELECT id FROM exchange_requests WHERE public_ref = ?1)').bind(ref).first();
+      return !!g;
+    },
+    async () => {
+      const fieldErr = exchangeFields(body, new Set(['approval_ref', 'scope', 'performer', 'expires_at', 'max_uses', 'grantee_usernames', 'disclosure_context']));
+      if (fieldErr) return fieldErr;
+      const reqRow = await getRequestByRef(env, ref);
+      if (!reqRow) return err('not_found', 'No such request.', 404);
+      if (reqRow.owner_agent_id !== agent.agent_id) return err('forbidden', 'Only the listing owner can grant this request.', 403);
+      if (reqRow.status !== 'requested') return err('bad_request', 'This request is not awaiting a decision.', 400);
+      if (Date.parse(reqRow.expires_at) <= Date.now()) {
+        return err('bad_request', 'This request has expired; its authorization window has ended. A late grant is not possible.', 400);
+      }
+      const listing = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(reqRow.listing_id).first();
+      if (!listingEligible(listing)) {
+        return err('bad_request', 'The listing is not currently eligible (live, attested for its current revision, no moderation lock), so no grant can be created.', 400);
+      }
+      if (await handoffBlocked(env, agent.agent_id, reqRow.requester_agent_id)) {
+        return err('blocked', 'A block is in effect between you and the requester; no grant can be created.', 403);
+      }
+      if (!body.approval_ref) {
+        return err('human_approval_required', 'Every Phase 1 grant needs a human approval record. An agent call on its own creates nothing: the listing owner\'s human operator records the approval first, then the grant names its approval_ref.', 403);
+      }
+      const approval = await env.DB.prepare('SELECT * FROM exchange_approvals WHERE public_ref = ?1').bind(String(body.approval_ref)).first();
+      if (!approval || approval.request_id !== reqRow.id || approval.approved_by_agent_id !== agent.agent_id) {
+        return err('human_approval_required', 'No valid human approval record names this request and this owner.', 403);
+      }
+      if (approval.status !== 'pending') {
+        return err('human_approval_required', 'That approval record is no longer pending (already consumed, withdrawn, or past its window). A fresh human approval is needed.', 403);
+      }
+      if (Date.parse(approval.approval_expires_at) <= Date.now()) {
+        return err('human_approval_required', 'That approval record is past its window. A fresh human approval is needed.', 403);
+      }
+      // Re-derive the proposal from the grant body and the live rows,
+      // and require an exact match with the approved canonical hash.
+      const scope = sanitizeContent(body.scope || '');
+      const performer = body.performer === undefined ? exchangePerformerDefault(listing.kind) : String(body.performer);
+      const expT = Date.parse(body.expires_at || '');
+      if (!scope || !Number.isFinite(expT)) {
+        return err('approval_mismatch', 'The grant body must carry the approved scope and grant expiry exactly as approved.', 400);
+      }
+      let granteeIds = parseIdList(approval.grantee_ids);
+      if (body.grantee_usernames !== undefined) {
+        granteeIds = [];
+        for (const n of body.grantee_usernames) {
+          const a = await exchangeAgentByName(env, n);
+          if (!a) return err('bad_grantee_set', `No such agent: ${n}.`, 400);
+          granteeIds.push(a.id);
+        }
+      }
+      // X1 (gate round 3): fail closed at grant as well as approve —
+      // a pre-fix approval row carrying an empty set mints nothing.
+      if (!granteeIds.length) {
+        return err('bad_grantee_set', 'The grantee set for this grant is empty. A grant must name at least one grantee; nobody can be granted to nobody.', 400);
+      }
+      const disclosure = body.disclosure_context === undefined ? JSON.parse(approval.disclosure_context || '{}') : body.disclosure_context;
+      const derived = {
+        attestation_revision: listing.attestation_revision,
+        disclosure_context: disclosure,
+        grant_expires_at: new Date(expT).toISOString(),
+        grantee_ids: granteeIds,
+        listing_ref: listing.public_ref,
+        listing_revision: listing.revision,
+        max_uses: body.max_uses === undefined ? approval.max_uses : body.max_uses,
+        performer,
+        request_ref: reqRow.public_ref,
+        scope,
+        terms_version: listing.terms_version || null,
+      };
+      const derivedHash = await exchangeProposalHash(derived);
+      if (derivedHash !== approval.canonical_hash) {
+        return err('approval_mismatch', 'The grant body differs from the human-approved proposal (grantees, scope, performer, expiry, cap, disclosure, or listing revision). Material changes need a fresh human approval.', 400);
+      }
+      for (const gid of granteeIds) {
+        if (await handoffBlocked(env, agent.agent_id, gid)) {
+          return err('blocked', 'A block is in effect between you and a named grantee; no grant can be created.', 403);
+        }
+      }
+      const now = new Date().toISOString();
+      const grantRef = exchangeRef();
+      const idemKey = request.headers.get('Idempotency-Key') || '';
+      // X4: the listing owner stays the request owner for the life of
+      // the request. The performer principal is recorded in its own
+      // column instead of overwriting owner_agent_id.
+      const performerAgentId = performer === 'owner' ? agent.agent_id : reqRow.requester_agent_id;
+      // Atomicity (gate round 3): consumption, grant insert,
+      // consumed_grant_id link, and the request transition land in
+      // ONE batch. The insert is conditional on this call's own
+      // consumption (status flipped by statement 1 with this call's
+      // timestamp), so a lost consumption race writes nothing at
+      // all — no manual rollback path remains.
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE exchange_approvals SET status = 'consumed', consumed_at = ?1 WHERE id = ?2 AND status = 'pending'`
+        ).bind(now, approval.id),
+        env.DB.prepare(
+          `INSERT INTO exchange_grants (public_ref, request_id, listing_id, listing_revision, attestation_revision,
+             owner_agent_id, requester_agent_id, grantee_type, grantee_channel_id, grantee_ids, grantee_snapshot_at,
+             scope, performer, status, max_uses, uses_declared, expires_at, approval_id, human_approved_by,
+             human_approved_at, disclosure_context, idempotency_key, created_at, updated_at)
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'active', ?14, 0, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+           WHERE EXISTS (SELECT 1 FROM exchange_approvals WHERE id = ?23 AND status = 'consumed' AND consumed_at = ?24)`
+        ).bind(grantRef, reqRow.id, listing.id, listing.revision, listing.attestation_revision,
+          agent.agent_id, reqRow.requester_agent_id, reqRow.grantee_type, reqRow.grantee_channel_id,
+          JSON.stringify([...new Set(granteeIds)].sort((a, b) => a - b)), now,
+          scope, performer, approval.max_uses, approval.grant_expires_at, approval.id,
+          approval.approved_by, approval.created_at, approval.disclosure_context, idemKey, now, now,
+          approval.id, now),
+        env.DB.prepare(
+          `UPDATE exchange_approvals SET consumed_grant_id = (SELECT id FROM exchange_grants WHERE public_ref = ?1)
+           WHERE id = ?2 AND EXISTS (SELECT 1 FROM exchange_grants WHERE public_ref = ?1)`
+        ).bind(grantRef, approval.id),
+        env.DB.prepare(
+          `UPDATE exchange_requests SET status = 'active', performer_agent_id = ?1, updated_at = ?2
+           WHERE id = ?3 AND status = 'requested' AND EXISTS (SELECT 1 FROM exchange_grants WHERE public_ref = ?4)`
+        ).bind(performerAgentId, now, reqRow.id, grantRef),
+      ]);
+      const grant = await env.DB.prepare('SELECT * FROM exchange_grants WHERE public_ref = ?1').bind(grantRef).first();
+      if (!grant) {
+        return err('human_approval_required', 'That approval record was just consumed or withdrawn. A fresh human approval is needed.', 403);
+      }
+      const grantId = grant.id;
+      await exchangeAudit(env, 'grant', grantId, agent.agent_id, 'granted', 'requested', 'active',
+        { grant_id: grantId, request_id: reqRow.id, approval_id: approval.id, canonical_hash: approval.canonical_hash });
+      await emitExchangeEvent(env, ctx, 'exchange.granted',
+        { request_ref: reqRow.public_ref, grant_ref: grantRef, state: 'active' },
+        [agent.agent_id, reqRow.requester_agent_id, ...granteeIds]);
+      return json({ grant: await grantView(env, grant, agent) }, 201);
+    });
+}
+
+async function handleExchangeDeny(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'request.deny', ref, body, null, async () => {
+    const fieldErr = exchangeFields(body, new Set(['reason']));
+    if (fieldErr) return fieldErr;
+    const reqRow = await getRequestByRef(env, ref);
+    if (!reqRow) return err('not_found', 'No such request.', 404);
+    if (reqRow.owner_agent_id !== agent.agent_id) return err('forbidden', 'Only the listing owner can deny this request.', 403);
+    const reason = body.reason ? sanitizeContent(body.reason).slice(0, 280) : null;
+    if (reason && scanCredentialText(reason)) return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
+    const now = new Date().toISOString();
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_requests SET status = 'denied', deny_reason = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'requested'`
+    ).bind(reason, now, reqRow.id).run();
+    if (upd.meta.changes !== 1) return err('bad_request', 'This request is not awaiting a decision.', 400);
+    await exchangeAudit(env, 'request', reqRow.id, agent.agent_id, 'denied', 'requested', 'denied', { request_id: reqRow.id });
+    await emitExchangeEvent(env, ctx, 'exchange.denied',
+      { request_ref: reqRow.public_ref, state: 'denied' }, [agent.agent_id, reqRow.requester_agent_id]);
+    await exchangeMaybeSettle(env, reqRow.id);
+    const row = await env.DB.prepare('SELECT * FROM exchange_requests WHERE id = ?1').bind(reqRow.id).first();
+    return json({ request: await requestView(env, row, agent) });
+  });
+}
+
+async function handleExchangeWithdraw(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'request.withdraw', ref, body, null, async () => {
+    const fieldErr = exchangeFields(body, new Set(['as_expired']));
+    if (fieldErr) return fieldErr;
+    const reqRow = await getRequestByRef(env, ref);
+    if (!reqRow) return err('not_found', 'No such request.', 404);
+    if (reqRow.requester_agent_id !== agent.agent_id) return err('forbidden', 'Only the requester can withdraw this request.', 403);
+    // Withdrawal stays possible even under a block (D6): taking an
+    // undecided ask back is a protective act, never a new grant path.
+    const toState = body.as_expired === true ? 'expired' : 'withdrawn';
+    const now = new Date().toISOString();
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_requests SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'requested'`
+    ).bind(toState, now, reqRow.id).run();
+    if (upd.meta.changes !== 1) return err('bad_request', 'Only an undecided request can be withdrawn.', 400);
+    await exchangeAudit(env, 'request', reqRow.id, agent.agent_id, toState === 'expired' ? 'closed_as_expired' : 'withdrawn', 'requested', toState, { request_id: reqRow.id });
+    await emitExchangeEvent(env, ctx, 'exchange.expired',
+      { request_ref: reqRow.public_ref, state: toState }, [agent.agent_id, reqRow.owner_agent_id]);
+    await exchangeMaybeSettle(env, reqRow.id);
+    const row = await env.DB.prepare('SELECT * FROM exchange_requests WHERE id = ?1').bind(reqRow.id).first();
+    return json({ request: await requestView(env, row, agent) });
+  });
+}
+
+async function handleExchangeGetRequest(request, env, ref) {
+  const { agent, error } = await exchangeRead(request, env);
+  if (error) return error;
+  const r = await getRequestByRef(env, ref);
+  if (!r) return err('not_found', 'No such request.', 404);
+  if (isRequestParty(r, agent.agent_id)) {
+    // X5 (gate round 3): the exit cut reaches the request view too.
+    // A non-principal grantee who exited the linked channel gets the
+    // state-only projection, exactly as on the grant view.
+    const isPrincipal = r.owner_agent_id === agent.agent_id || r.requester_agent_id === agent.agent_id;
+    if (!isPrincipal) {
+      const gr = await env.DB.prepare('SELECT * FROM exchange_grants WHERE request_id = ?1').bind(r.id).first();
+      if (gr && (await grantExitInfo(env, gr, agent.agent_id)).denied) {
+        return json({ request: requestStateView(r), projection: 'state_only' });
+      }
+    }
+    return json({ request: await requestView(env, r, agent) });
+  }
+  if (/^\d+$/.test(String(ref))) return err('not_found', 'No such request.', 404);
+  // Coordinator (not a leg party) and channel observers: state only.
+  if (r.exchange_id) {
+    const ex = await env.DB.prepare('SELECT coordinator_agent_id FROM exchange_exchanges WHERE id = ?1').bind(r.exchange_id).first();
+    if (ex && ex.coordinator_agent_id === agent.agent_id) return json({ request: requestStateView(r), projection: 'state_only' });
+  }
+  if (r.channel_id) {
+    const ch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(r.channel_id).first();
+    if (ch && (await channelMember(env, ch, agent.agent_id))) return json({ request: requestStateView(r), projection: 'state_only' });
+  }
+  return err('not_found', 'No such request.', 404);
+}
+
+
+/** Q4 exit rule for channel-linked grants: the grantee set is fixed
+ *  at approval, AND an agent who leaves or is removed from the linked
+ *  channel after the grant loses act authority under that grant at
+ *  once. Rejoining does not restore it — a fresh grant is the only
+ *  way back. Returns the channel row when the exit rule denies the
+ *  actor, else null. */
+async function grantExitDenied(env, g, actorId) {
+  let channelId = g.grantee_channel_id || null;
+  if (!channelId) {
+    const reqRow = await env.DB.prepare('SELECT channel_id FROM exchange_requests WHERE id = ?1').bind(g.request_id).first();
+    if (reqRow) channelId = reqRow.channel_id;
+  }
+  if (!channelId) return null;
+  const ch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(channelId).first();
+  if (!ch) return null;
+  const exitRow = await channelExitRow(env, ch.id, g.grantee_snapshot_at, actorId);
+  if (exitRow) return ch;
+  if (g.grantee_type === 'channel' && !(await channelMember(env, ch, actorId))) return ch;
+  return null;
+}
+
+/** Gate round 3 (X5 completed): grantExitDenied as a yes/no plus the
+ *  exit timestamp when a leave/remove row exists, so read surfaces
+ *  can cut an exited grantee's view at their exit instead of only
+ *  refusing actions. exitAt is null when the denial rests on current
+ *  non-membership with no recorded exit row. */
+async function grantExitInfo(env, g, actorId) {
+  let channelId = g.grantee_channel_id || null;
+  if (!channelId) {
+    const reqRow = await env.DB.prepare('SELECT channel_id FROM exchange_requests WHERE id = ?1').bind(g.request_id).first();
+    if (reqRow) channelId = reqRow.channel_id;
+  }
+  if (!channelId) return { denied: false, exitAt: null };
+  const ch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(channelId).first();
+  if (!ch) return { denied: false, exitAt: null };
+  const exitRow = await channelExitRow(env, ch.id, g.grantee_snapshot_at, actorId);
+  if (exitRow) return { denied: true, exitAt: exitRow.created_at };
+  if (g.grantee_type === 'channel' && !(await channelMember(env, ch, actorId))) return { denied: true, exitAt: null };
+  return { denied: false, exitAt: null };
+}
+
+// --- Grant transitions --------------------------------------------------------
+
+function grantCounterpartyOk(g, actorId) {
+  // The confirming/reopening side is the non-performer party.
+  if (g.performer === 'grantee') return actorId === g.owner_agent_id;
+  return actorId === g.requester_agent_id;
+}
+function grantPerformerOk(g, actorId) {
+  if (g.performer === 'owner') return actorId === g.owner_agent_id;
+  return parseIdList(g.grantee_ids).includes(actorId);
+}
+function grantResultRecipients(g) {
+  // Who the result is for: the non-performer side's principals.
+  if (g.performer === 'grantee') return [g.owner_agent_id];
+  return parseIdList(g.grantee_ids);
+}
+
+const EXCHANGE_NOT_SCANNABLE_TYPES = new Set([
+  'application/zip', 'application/x-zip-compressed', 'application/gzip',
+  'application/x-7z-compressed', 'application/x-rar-compressed',
+  'application/octet-stream', 'application/pgp-encrypted',
+]);
+
+/** D3 attachment check: share authority, scan, pin. Returns
+ *  {file, digest, version} or {error}. */
+async function exchangeCheckResultFile(env, g, actor, fileId) {
+  const file = await env.DB.prepare('SELECT * FROM files WHERE id = ?1').bind(fileId).first();
+  if (!file) return { error: err('not_found', 'No such file.', 404) };
+  if (Date.parse(file.expires_at) <= Date.now()) return { error: err('bad_file', 'That file has expired.', 400) };
+  const recipients = grantResultRecipients(g);
+  // X1 (gate round 3): fail closed when the recipient set is empty.
+  // The share loop below iterates the recipients; with zero of them
+  // it never runs, and in round 2 a non-uploader could attach any
+  // file to such a grant. An empty set now refuses everyone,
+  // uploader included: there is nobody the result is for.
+  if (!recipients.length) {
+    return { error: err('bad_grantee_set', 'This grant names no result recipients (its grantee set is empty), so no result file can be attached to it.', 400) };
+  }
+  const isUploader = file.agent_id === actor.agent_id;
+  if (!isUploader) {
+    // X1: reading a file is not authority to attach it. A non-uploader
+    // may attach only when the uploader recorded a share for THIS
+    // grant; a share recorded for any other purpose does not count.
+    for (const rid of recipients) {
+      const share = await env.DB.prepare(
+        'SELECT id, owner_agent_id FROM exchange_file_shares WHERE file_id = ?1 AND recipient_agent_id = ?2 AND grant_id = ?3'
+      ).bind(fileId, rid, g.id).first();
+      if (!share || share.owner_agent_id !== file.agent_id) {
+        return { error: err('forbidden', 'You may read that file, but reading is not authority to share it. The uploader must record a share for this grant and its approved recipients first.', 403) };
+      }
+    }
+  }
+  if (Number(file.size) > EXCHANGE_RESULT_MAX_BYTES) {
+    return { error: err('file_too_large', 'A result file is capped at 10 MB for Exchange attachment.', 413) };
+  }
+  const ext = String(file.filename || '').toLowerCase();
+  if (EXCHANGE_NOT_SCANNABLE_TYPES.has(String(file.content_type || '').toLowerCase())
+    || /\.(zip|gz|tgz|7z|rar|enc|gpg|pgp)$/.test(ext)) {
+    await env.DB.prepare(
+      `INSERT INTO exchange_file_scans (file_id, file_version, file_digest, scan_status, scanned_by_agent_id, created_at)
+       VALUES (?1, ?2, NULL, 'not_scannable', ?3, ?4)`
+    ).bind(fileId, file.version || 1, actor.agent_id, new Date().toISOString()).run();
+    return { error: err('file_not_scannable', 'That file type cannot be checked by the Exchange scanner (archives and encrypted files are not accepted as results), so it cannot be attached.', 400) };
+  }
+  if (!env.FILES) {
+    await env.DB.prepare(
+      `INSERT INTO exchange_file_scans (file_id, file_version, file_digest, scan_status, scanned_by_agent_id, created_at)
+       VALUES (?1, ?2, NULL, 'quarantined', ?3, ?4)`
+    ).bind(fileId, file.version || 1, actor.agent_id, new Date().toISOString()).run();
+    return { error: err('file_scan_failed', 'The file could not be checked (file storage is unavailable), so it was not attached. Nothing was released.', 400) };
+  }
+  let bytes;
+  try {
+    const obj = await env.FILES.get(file.r2_key);
+    if (!obj) throw new Error('missing object');
+    bytes = new Uint8Array(await obj.arrayBuffer());
+  } catch {
+    await env.DB.prepare(
+      `INSERT INTO exchange_file_scans (file_id, file_version, file_digest, scan_status, scanned_by_agent_id, created_at)
+       VALUES (?1, ?2, NULL, 'quarantined', ?3, ?4)`
+    ).bind(fileId, file.version || 1, actor.agent_id, new Date().toISOString()).run();
+    return { error: err('file_scan_failed', 'The file could not be checked (the stored copy could not be read), so it was not attached. Nothing was released.', 400) };
+  }
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    await env.DB.prepare(
+      `INSERT INTO exchange_file_scans (file_id, file_version, file_digest, scan_status, scanned_by_agent_id, created_at)
+       VALUES (?1, ?2, NULL, 'not_scannable', ?3, ?4)`
+    ).bind(fileId, file.version || 1, actor.agent_id, new Date().toISOString()).run();
+    return { error: err('file_not_scannable', 'That file is not text-decodable content the Exchange scanner can check, so it cannot be attached.', 400) };
+  }
+  const digest = await sha256hex(text);
+  const cred = scanCredentialText(text);
+  const now = new Date().toISOString();
+  if (cred) {
+    await env.DB.prepare(
+      `INSERT INTO exchange_file_scans (file_id, file_version, file_digest, scan_status, pattern_class, scanned_by_agent_id, created_at)
+       VALUES (?1, ?2, ?3, 'rejected', ?4, ?5, ?6)`
+    ).bind(fileId, file.version || 1, digest, cred, actor.agent_id, now).run();
+    await exchangeAudit(env, 'grant', g.id, actor.agent_id, 'credential_blocked', null, null, { grant_id: g.id, pattern_class: cred });
+    return { error: err('credential_blocked', 'That file contains a credential-shaped string and was not attached. The rejection is logged by pattern class only.', 400) };
+  }
+  await env.DB.prepare(
+    `INSERT INTO exchange_file_scans (file_id, file_version, file_digest, scan_status, scanned_by_agent_id, created_at)
+     VALUES (?1, ?2, ?3, 'clean', ?4, ?5)`
+  ).bind(fileId, file.version || 1, digest, actor.agent_id, now).run();
+  return { file, digest, version: file.version || 1 };
+}
+
+async function handleExchangeGrantDone(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'grant.done', ref, body,
+    async () => {
+      const g = await getGrantByRef(env, ref);
+      // X5 (gate round 3): a stored replay is a read of the full
+      // grant response, so the exit cut applies here too — an
+      // exited grantee's replay re-authorizes as not found.
+      return !!g && isGrantParty(g, agent.agent_id) && !(await grantExitDenied(env, g, agent.agent_id));
+    },
+    async () => {
+      const fieldErr = exchangeFields(body, new Set(['result_file_id']));
+      if (fieldErr) return fieldErr;
+      const g = await getGrantByRef(env, ref);
+      if (!g) return err('not_found', 'No such grant.', 404);
+      if (!grantPerformerOk(g, agent.agent_id)) return err('forbidden', 'Only the performer side can declare completion on this grant.', 403);
+      if (await grantExitDenied(env, g, agent.agent_id)) {
+        return err('forbidden', 'You left or were removed from the channel linked to this grant after it was granted, so you can no longer act under it. A fresh grant is the only way back.', 403);
+      }
+      if (g.status !== 'active') return err('bad_request', 'This grant is not active.', 400);
+      if (Date.parse(g.expires_at) <= Date.now()) {
+        return err('bad_request', 'This grant has expired; its authorization window has ended. An expiry says nothing about work off-platform — only that authorization under this grant has ended.', 400);
+      }
+      const counterpartyId = g.performer === 'grantee' ? g.owner_agent_id : g.requester_agent_id;
+      if (await handoffBlocked(env, agent.agent_id, counterpartyId)) {
+        return err('blocked', 'A block is in effect between the parties; this transition cannot be made.', 403);
+      }
+      if (g.max_uses != null && g.uses_declared + 1 > g.max_uses) {
+        return err('bad_request', 'The declaration cap on this grant is used up. A further use needs a fresh request and a fresh human approval.', 400);
+      }
+      let filePin = { file: null, digest: null, version: null };
+      if (body.result_file_id !== undefined && body.result_file_id !== null) {
+        const fileId = parseInt(body.result_file_id, 10);
+        if (!Number.isFinite(fileId)) return err('bad_file', 'result_file_id must be an integer.', 400);
+        const checked = await exchangeCheckResultFile(env, g, agent, fileId);
+        if (checked.error) return checked.error;
+        filePin = checked;
+      }
+      const now = new Date().toISOString();
+      const upd = await env.DB.prepare(
+        `UPDATE exchange_grants SET status = 'done', done_by_agent_id = ?1, done_at = ?2,
+           result_file_id = ?3, result_file_version = ?4, result_file_digest = ?5,
+           result_file_scan_status = ?6, uses_declared = uses_declared + 1, updated_at = ?2
+         WHERE id = ?7 AND status = 'active' AND expires_at > ?2`
+      ).bind(agent.agent_id, now, filePin.file ? filePin.file.id : null, filePin.version, filePin.digest,
+        filePin.file ? 'clean' : null, g.id).run();
+      if (upd.meta.changes !== 1) return err('bad_request', 'This grant is not active.', 400);
+      await env.DB.prepare(
+        `UPDATE exchange_requests SET status = 'done', updated_at = ?1 WHERE id = ?2`
+      ).bind(now, g.request_id).run();
+      await exchangeAudit(env, 'grant', g.id, agent.agent_id, 'done', 'active', 'done',
+        { grant_id: g.id, file_id: filePin.file ? filePin.file.id : null });
+      await emitExchangeEvent(env, ctx, 'exchange.done',
+        { grant_ref: g.public_ref, state: 'done' },
+        [g.owner_agent_id, g.requester_agent_id, ...parseIdList(g.grantee_ids)]);
+      const row = await env.DB.prepare('SELECT * FROM exchange_grants WHERE id = ?1').bind(g.id).first();
+      return json({ grant: await grantView(env, row, agent) });
+    });
+}
+
+async function handleExchangeGrantConfirm(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'grant.confirm', ref, body,
+    async () => {
+      const g = await getGrantByRef(env, ref);
+      return !!g && isGrantParty(g, agent.agent_id);
+    },
+    async () => {
+      const fieldErr = exchangeFields(body, new Set([]));
+      if (fieldErr) return fieldErr;
+      const g = await getGrantByRef(env, ref);
+      if (!g) return err('not_found', 'No such grant.', 404);
+      if (g.done_by_agent_id && g.done_by_agent_id === agent.agent_id) {
+        return err('forbidden', 'The agent who declared completion cannot confirm it. Confirmation comes from the counterparty.', 403);
+      }
+      if (!grantCounterpartyOk(g, agent.agent_id)) return err('forbidden', 'Only the counterparty can confirm this completion.', 403);
+      if (g.status !== 'done') return err('bad_request', 'This grant has no completion awaiting confirmation.', 400);
+      if (Date.parse(g.expires_at) <= Date.now()) {
+        return err('bad_request', 'This grant has expired; its authorization window has ended, and the unconfirmed declaration mints nothing.', 400);
+      }
+      if (await handoffBlocked(env, agent.agent_id, g.done_by_agent_id)) {
+        return err('blocked', 'A block is in effect between the parties; this transition cannot be made and nothing is minted.', 403);
+      }
+      const existing = await env.DB.prepare(
+        `SELECT id FROM receipts WHERE kind = 'exchange' AND source_id = ?1`
+      ).bind(g.id).first();
+      if (existing) return err('receipt_exists', 'A receipt already exists for this grant. One grant mints at most one receipt.', 400);
+      const now = new Date().toISOString();
+      const reqRow = await env.DB.prepare('SELECT listing_title FROM exchange_requests WHERE id = ?1').bind(g.request_id).first();
+      const subjOp = await env.DB.prepare('SELECT operator_id FROM agent_operators WHERE agent_id = ?1').bind(g.done_by_agent_id).first();
+      const confOp = await env.DB.prepare('SELECT operator_id FROM agent_operators WHERE agent_id = ?1').bind(agent.agent_id).first();
+      const receiptRef = exchangeRef();
+      // Atomicity (gate round 3): the grant transition, the receipt
+      // insert, and the request transition land in ONE batch, so a
+      // throw can never leave a confirmed grant with no receipt. The
+      // receipt insert is conditional on this call's own transition
+      // (statement 1 with this call's timestamp); if the guarded
+      // update missed, nothing is written at all.
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE exchange_grants SET status = 'confirmed', updated_at = ?1 WHERE id = ?2 AND status = 'done' AND expires_at > ?1`
+        ).bind(now, g.id),
+        env.DB.prepare(
+          `INSERT INTO receipts (public_ref, kind, source_id, subject_agent_id, confirmer_agent_id, source_title, price_cents, currency, funded, started_at, subject_operator, confirmer_operator, created_at)
+           SELECT ?1, 'exchange', ?2, ?3, ?4, ?5, NULL, NULL, 0, ?6, ?7, ?8, ?9
+           WHERE EXISTS (SELECT 1 FROM exchange_grants WHERE id = ?10 AND status = 'confirmed' AND updated_at = ?11)`
+        ).bind(receiptRef, g.id, g.done_by_agent_id, agent.agent_id, reqRow ? reqRow.listing_title : null, g.created_at,
+          subjOp ? subjOp.operator_id : 'unknown', confOp ? confOp.operator_id : 'unknown', now, g.id, now),
+        env.DB.prepare(
+          `UPDATE exchange_requests SET status = 'confirmed', updated_at = ?1 WHERE id = ?2
+           AND EXISTS (SELECT 1 FROM receipts WHERE public_ref = ?3)`
+        ).bind(now, g.request_id, receiptRef),
+      ]);
+      const receiptRow = await env.DB.prepare('SELECT id FROM receipts WHERE public_ref = ?1').bind(receiptRef).first();
+      if (!receiptRow) return err('bad_request', 'This grant has no completion awaiting confirmation.', 400);
+      await exchangeAudit(env, 'grant', g.id, agent.agent_id, 'confirmed', 'done', 'confirmed',
+        { grant_id: g.id, receipt_id: receiptRow.id });
+      await exchangeAudit(env, 'receipt', receiptRow.id, agent.agent_id, 'minted', null, 'confirmed_by_counterparty',
+        { receipt_id: receiptRow.id, grant_id: g.id });
+      await emitExchangeEvent(env, ctx, 'exchange.confirmed',
+        { grant_ref: g.public_ref, receipt_ref: receiptRef, state: 'confirmed' },
+        [g.owner_agent_id, g.requester_agent_id, ...parseIdList(g.grantee_ids)]);
+      await exchangeMaybeSettle(env, g.request_id);
+      const row = await env.DB.prepare('SELECT * FROM exchange_grants WHERE id = ?1').bind(g.id).first();
+      return json({
+        grant: await grantView(env, row, agent),
+        receipt: {
+          ref: receiptRef, kind: 'exchange',
+          wording: 'confirmed by counterparty',
+          funded: 0,
+        },
+      });
+    });
+}
+
+async function handleExchangeGrantReopen(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'grant.reopen', ref, body, null, async () => {
+    const fieldErr = exchangeFields(body, new Set([]));
+    if (fieldErr) return fieldErr;
+    const g = await getGrantByRef(env, ref);
+    if (!g) return err('not_found', 'No such grant.', 404);
+    if (!grantCounterpartyOk(g, agent.agent_id)) return err('forbidden', 'Only the counterparty can hand a completion back.', 403);
+    const now = new Date().toISOString();
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_grants SET status = 'active', done_by_agent_id = NULL, done_at = NULL,
+         result_file_id = NULL, result_file_version = NULL, result_file_digest = NULL,
+         result_file_scan_status = NULL, updated_at = ?1
+       WHERE id = ?2 AND status = 'done'`
+    ).bind(now, g.id).run();
+    if (upd.meta.changes !== 1) return err('bad_request', 'This grant has no completion awaiting confirmation.', 400);
+    await env.DB.prepare(
+      `UPDATE exchange_requests SET status = 'active', updated_at = ?1 WHERE id = ?2`
+    ).bind(now, g.request_id).run();
+    // The declaration count is NOT rolled back: a declared use
+    // happened, and the cap counts declarations (spec 5.2).
+    await exchangeAudit(env, 'grant', g.id, agent.agent_id, 'reopened', 'done', 'active', { grant_id: g.id });
+    const row = await env.DB.prepare('SELECT * FROM exchange_grants WHERE id = ?1').bind(g.id).first();
+    return json({ grant: await grantView(env, row, agent) });
+  });
+}
+
+async function handleExchangeGrantRevoke(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'grant.revoke', ref, body, null, async () => {
+    const fieldErr = exchangeFields(body, new Set(['reason']));
+    if (fieldErr) return fieldErr;
+    const g = await getGrantByRef(env, ref);
+    if (!g) return err('not_found', 'No such grant.', 404);
+    if (g.owner_agent_id !== agent.agent_id) return err('forbidden', 'Only the listing owner can end this authorization early.', 403);
+    const reason = body.reason ? sanitizeContent(body.reason).slice(0, 280) : null;
+    if (reason && scanCredentialText(reason)) return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
+    // Revocation stays possible under a block (D6): ending an
+    // authorization is the owner's protective act.
+    const now = new Date().toISOString();
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_grants SET status = 'revoked', revoke_reason = ?1, updated_at = ?2
+       WHERE id = ?3 AND status IN ('active','done')`
+    ).bind(reason, now, g.id).run();
+    if (upd.meta.changes !== 1) return err('bad_request', 'This grant is not in a state the owner can end early (a confirmed completion stands as recorded).', 400);
+    await env.DB.prepare(
+      `UPDATE exchange_requests SET status = 'revoked', updated_at = ?1 WHERE id = ?2`
+    ).bind(now, g.request_id).run();
+    await exchangeAudit(env, 'grant', g.id, agent.agent_id, 'revoked', g.status, 'revoked', { grant_id: g.id });
+    await emitExchangeEvent(env, ctx, 'exchange.revoked',
+      { grant_ref: g.public_ref, state: 'revoked' },
+      [g.owner_agent_id, g.requester_agent_id, ...parseIdList(g.grantee_ids)]);
+    await exchangeMaybeSettle(env, g.request_id);
+    const row = await env.DB.prepare('SELECT * FROM exchange_grants WHERE id = ?1').bind(g.id).first();
+    const view = await grantView(env, row, agent);
+    view.notice = 'Authorization under this grant has ended. Execution happens off-platform, so this record does not say anything about work the parties may have done — only that authorization under this grant has ended.';
+    return json({ grant: view });
+  });
+}
+
+async function handleExchangeGetGrant(request, env, ref) {
+  const { agent, error } = await exchangeRead(request, env);
+  if (error) return error;
+  const g = await getGrantByRef(env, ref);
+  if (!g) return err('not_found', 'No such grant.', 404);
+  if (isGrantParty(g, agent.agent_id)) {
+    // X5: a grantee who exited the linked channel loses the full
+    // grant view as well as act authority; what remains is the
+    // state-only projection any channel observer gets.
+    const isPrincipal = g.owner_agent_id === agent.agent_id || g.requester_agent_id === agent.agent_id;
+    if (isPrincipal || !(await grantExitDenied(env, g, agent.agent_id))) {
+      return json({ grant: await grantView(env, g, agent) });
+    }
+    return json({ grant: grantStateView(g), projection: 'state_only' });
+  }
+  if (/^\d+$/.test(String(ref))) return err('not_found', 'No such grant.', 404);
+  const reqRow = await env.DB.prepare('SELECT exchange_id, channel_id FROM exchange_requests WHERE id = ?1').bind(g.request_id).first();
+  if (reqRow && reqRow.exchange_id) {
+    const ex = await env.DB.prepare('SELECT coordinator_agent_id FROM exchange_exchanges WHERE id = ?1').bind(reqRow.exchange_id).first();
+    if (ex && ex.coordinator_agent_id === agent.agent_id) return json({ grant: grantStateView(g), projection: 'state_only' });
+  }
+  if (reqRow && reqRow.channel_id) {
+    const ch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(reqRow.channel_id).first();
+    if (ch && (await channelMember(env, ch, agent.agent_id))) return json({ grant: grantStateView(g), projection: 'state_only' });
+  }
+  return err('not_found', 'No such grant.', 404);
+}
+
+/** GET /api/v1/exchange/grants/:ref/result — the pinned, re-checked
+ *  result download (D3/D4). Served as an attachment; never run, and
+ *  nothing inside it is fetched. */
+async function handleExchangeGrantResult(request, env, ref) {
+  const { agent, error } = await exchangeRead(request, env);
+  if (error) return error;
+  const g = await getGrantByRef(env, ref);
+  if (!g || !g.result_file_id) return err('not_found', 'No result file on this grant.', 404);
+  const recipients = grantResultRecipients(g);
+  const mayRead = g.owner_agent_id === agent.agent_id
+    || recipients.includes(agent.agent_id)
+    || (g.done_by_agent_id === agent.agent_id);
+  if (!mayRead) return err('not_found', 'No result file on this grant.', 404);
+  // Access is re-checked at retrieval (D4): a reader who exited the
+  // linked channel after the grant no longer reaches the file.
+  if (agent.agent_id !== g.owner_agent_id && (await grantExitDenied(env, g, agent.agent_id))) {
+    return err('not_found', 'No result file on this grant.', 404);
+  }
+  if (g.status !== 'done' && g.status !== 'confirmed') return err('not_found', 'No result file on this grant.', 404);
+  // X8: this handler checks grant expiry itself; it never relies on
+  // the lazy sweep having run first.
+  if (Date.parse(g.expires_at) <= Date.now()) return err('not_found', 'No result file on this grant.', 404);
+  if (!env.FILES) return err('storage_unavailable', 'File storage is not configured yet.', 503);
+  const file = await env.DB.prepare('SELECT * FROM files WHERE id = ?1').bind(g.result_file_id).first();
+  if (!file) return err('not_found', 'Result file is gone.', 404);
+  // X1: an agent whose only claim is having declared completion
+  // reads the result only when they uploaded the file themselves.
+  if (g.done_by_agent_id === agent.agent_id && g.owner_agent_id !== agent.agent_id
+    && !recipients.includes(agent.agent_id) && file.agent_id !== agent.agent_id) {
+    return err('not_found', 'No result file on this grant.', 404);
+  }
+  let bytes;
+  try {
+    const obj = await env.FILES.get(file.r2_key);
+    if (!obj) return err('not_found', 'Result file is gone.', 404);
+    bytes = new Uint8Array(await obj.arrayBuffer());
+  } catch {
+    return err('storage_unavailable', 'File storage is not configured yet.', 503);
+  }
+  let text = null;
+  try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { /* digest compare below uses bytes-as-text fallback */ }
+  const digest = text !== null ? await sha256hex(text) : null;
+  if (!digest || digest !== g.result_file_digest || Number(file.version || 1) !== Number(g.result_file_version)) {
+    await env.DB.prepare(
+      `INSERT INTO exchange_file_scans (file_id, file_version, file_digest, scan_status, scanned_by_agent_id, created_at)
+       VALUES (?1, ?2, ?3, 'quarantined', ?4, ?5)`
+    ).bind(file.id, file.version || 1, digest, agent.agent_id, new Date().toISOString()).run();
+    await exchangeAudit(env, 'grant', g.id, agent.agent_id, 'result_quarantined', null, null, { grant_id: g.id, file_id: file.id });
+    return err('file_changed', 'The stored file no longer matches the version pinned at completion, so it is not released. The performer can attach the file again.', 409);
+  }
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${String(file.filename || 'result').replace(/"/g, '')}"`,
+      'Content-Length': String(bytes.length),
+      'Cache-Control': 'private, no-store',
+      ...securityHeaders(),
+    },
+  });
+}
+
+// --- Multi-party exchanges -----------------------------------------------------
+
+async function handleExchangeCreateExchange(request, env, ctx) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'exchange.create', '', body, null, async () => {
+    const fieldErr = exchangeFields(body, new Set(['title', 'purpose', 'channel_ref']));
+    if (fieldErr) return fieldErr;
+    const title = sanitizeContent(body.title || '');
+    const purpose = sanitizeContent(body.purpose || '');
+    if (!title || !purpose) return err('bad_request', 'title and purpose are required.', 400);
+    if (scanCredentialFields([title, purpose])) return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
+    let channelId = null;
+    if (body.channel_ref) {
+      const ch = await getChannelByRef(env, body.channel_ref);
+      if (!ch || !(await channelMember(env, ch, agent.agent_id))) return err('not_found', 'No such channel.', 404);
+      channelId = ch.id;
+    }
+    const now = new Date().toISOString();
+    const ref = exchangeRef();
+    const idemKey = request.headers.get('Idempotency-Key') || '';
+    const ins = await env.DB.prepare(
+      `INSERT INTO exchange_exchanges (public_ref, coordinator_agent_id, title, purpose, channel_id, status, idempotency_key, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?7)`
+    ).bind(ref, agent.agent_id, title, purpose, channelId, idemKey, now).run();
+    const row = await env.DB.prepare('SELECT * FROM exchange_exchanges WHERE id = ?1').bind(ins.meta.last_row_id).first();
+    await exchangeAudit(env, 'exchange', row.id, agent.agent_id, 'created', null, 'open', { exchange_id: row.id });
+    return json({
+      exchange: {
+        ref: row.public_ref, title: row.title, purpose: row.purpose,
+        coordinator: agent.username, status: row.status, legs: [],
+        created_at: row.created_at, updated_at: row.updated_at,
+      },
+    }, 201);
+  });
+}
+
+async function handleExchangeGetExchange(request, env, ref) {
+  const { agent, error } = await exchangeRead(request, env);
+  if (error) return error;
+  const ex = await getExchangeByRef(env, ref);
+  if (!ex) return err('not_found', 'No such exchange.', 404);
+  const legs = await env.DB.prepare('SELECT * FROM exchange_requests WHERE exchange_id = ?1 ORDER BY id').bind(ex.id).all();
+  const legRows = legs.results || [];
+  const isCoordinator = ex.coordinator_agent_id === agent.agent_id;
+  const isLegParty = legRows.some((r) => isRequestParty(r, agent.agent_id));
+  let isObserver = false;
+  if (ex.channel_id) {
+    const ch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(ex.channel_id).first();
+    if (ch) isObserver = await channelMember(env, ch, agent.agent_id);
+  }
+  if (!isCoordinator && !isLegParty && !isObserver) return err('not_found', 'No such exchange.', 404);
+  const legViews = [];
+  for (const r of legRows) {
+    let full = isRequestParty(r, agent.agent_id);
+    if (full && r.owner_agent_id !== agent.agent_id && r.requester_agent_id !== agent.agent_id) {
+      // X5 (gate round 3): the exit cut reaches leg views as well —
+      // an exited grantee sees their leg state-only here too.
+      const gr = await env.DB.prepare('SELECT * FROM exchange_grants WHERE request_id = ?1').bind(r.id).first();
+      if (gr && (await grantExitInfo(env, gr, agent.agent_id)).denied) full = false;
+    }
+    legViews.push(full ? await requestView(env, r, agent) : requestStateView(r));
+  }
+  return json({
+    exchange: {
+      ref: ex.public_ref, title: ex.title, purpose: (isCoordinator || isLegParty) ? ex.purpose : undefined,
+      coordinator: await exchangeAgentName(env, ex.coordinator_agent_id),
+      status: ex.status, legs: legViews, projection: (!isCoordinator && !isLegParty) ? 'state_only' : 'full',
+      created_at: ex.created_at, updated_at: ex.updated_at,
+    },
+  });
+}
+
+async function handleExchangeCancelExchange(request, env, ctx, ref) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return exchangeIdem(request, env, agent, 'exchange.cancel', ref, body, null, async () => {
+    const fieldErr = exchangeFields(body, new Set([]));
+    if (fieldErr) return fieldErr;
+    const ex = await getExchangeByRef(env, ref);
+    if (!ex) return err('not_found', 'No such exchange.', 404);
+    if (ex.coordinator_agent_id !== agent.agent_id) return err('forbidden', 'Only the coordinator can cancel this exchange.', 403);
+    const live = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM exchange_grants gr JOIN exchange_requests r ON r.id = gr.request_id
+       WHERE r.exchange_id = ?1 AND gr.status IN ('active','done')`
+    ).bind(ex.id).first();
+    if (live && live.n > 0) {
+      return err('bad_request', 'This exchange holds a grant that is active or awaiting confirmation. Those legs are governed by their own grants, not by the exchange record.', 400);
+    }
+    const now = new Date().toISOString();
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_exchanges SET status = 'cancelled', updated_at = ?1 WHERE id = ?2 AND status = 'open'`
+    ).bind(now, ex.id).run();
+    if (upd.meta.changes !== 1) return err('bad_request', 'This exchange is not open.', 400);
+    await exchangeAudit(env, 'exchange', ex.id, agent.agent_id, 'cancelled', 'open', 'cancelled', { exchange_id: ex.id });
+    const row = await env.DB.prepare('SELECT * FROM exchange_exchanges WHERE id = ?1').bind(ex.id).first();
+    return json({ exchange: { ref: row.public_ref, status: row.status } });
+  });
+}
+
+// --- Audit, receipts, summaries --------------------------------------------------
+
+const EXCHANGE_OBJECT_LOOKUP = {
+  listing: async (env, ref) => getListingByRef(env, ref),
+  request: async (env, ref) => getRequestByRef(env, ref),
+  grant: async (env, ref) => getGrantByRef(env, ref),
+  exchange: async (env, ref) => getExchangeByRef(env, ref),
+  channel: async (env, ref) => getChannelByRef(env, ref),
+};
+
+async function handleExchangeAuditRead(request, env, kind, ref) {
+  const { agent, error } = await exchangeRead(request, env);
+  if (error) return error;
+  const lookup = EXCHANGE_OBJECT_LOOKUP[kind];
+  if (!lookup) return err('not_found', 'No such object.', 404);
+  const obj = await lookup(env, ref);
+  if (!obj) return err('not_found', 'No such object.', 404);
+  let isParty = false;
+  let exitCutoff = null;
+  if (kind === 'listing') isParty = obj.owner_agent_id === agent.agent_id;
+  if (kind === 'request') isParty = isRequestParty(obj, agent.agent_id);
+  if (kind === 'grant') {
+    isParty = isGrantParty(obj, agent.agent_id);
+    if (isParty) {
+      // X5 (gate round 3): an exited grantee keeps the grant trail
+      // only up to their exit — the same cutoff the channel trail
+      // already applies. Principals keep the full trail.
+      const isPrincipal = obj.owner_agent_id === agent.agent_id || obj.requester_agent_id === agent.agent_id;
+      if (!isPrincipal) {
+        const info = await grantExitInfo(env, obj, agent.agent_id);
+        if (info.denied) exitCutoff = info.exitAt || obj.grantee_snapshot_at;
+      }
+    }
+  }
+  if (kind === 'exchange') {
+    isParty = obj.coordinator_agent_id === agent.agent_id;
+    if (!isParty) {
+      const legs = await env.DB.prepare('SELECT requester_agent_id, owner_agent_id, grantee_agent_ids FROM exchange_requests WHERE exchange_id = ?1').bind(obj.id).all();
+      isParty = (legs.results || []).some((r) => isRequestParty(r, agent.agent_id));
+    }
+  }
+  if (kind === 'channel') {
+    isParty = await channelMember(env, obj, agent.agent_id);
+    if (!isParty) {
+      // A party who exited keeps the trail up to their exit (D2).
+      // X3: exact numeric match on the parsed detail, never a
+      // substring match (agent 1 must not inherit agent 12's exit).
+      const exitRows = await env.DB.prepare(
+        `SELECT detail_json, created_at FROM exchange_audit WHERE object_kind = 'channel' AND object_id = ?1
+         AND action IN ('member_left','member_removed') ORDER BY id DESC`
+      ).bind(obj.id).all();
+      let exitRow = null;
+      for (const r of exitRows.results || []) {
+        if (auditDetailAgentId(r) === agent.agent_id) { exitRow = r; break; }
+      }
+      if (exitRow) { isParty = true; exitCutoff = exitRow.created_at; }
+    }
+  }
+  if (!isParty) return err('not_found', 'No such object.', 404);
+  const rows = await env.DB.prepare(
+    `SELECT id, actor_agent_id, action, from_state, to_state, detail_json, created_at FROM exchange_audit
+     WHERE object_kind = ?1 AND object_id = ?2 ${exitCutoff ? 'AND created_at <= ?3' : ''} ORDER BY id`
+  ).bind(...(exitCutoff ? [kind, obj.id, exitCutoff] : [kind, obj.id])).all();
+  const entries = [];
+  for (const r of rows.results || []) {
+    let detail = null;
+    try { detail = r.detail_json ? JSON.parse(r.detail_json) : null; } catch { detail = null; }
+    if (detail && typeof detail === 'object') {
+      for (const k of Object.keys(detail)) if (/_id$/.test(k) && typeof detail[k] === 'number') delete detail[k];
+    }
+    entries.push({
+      actor: r.actor_agent_id ? await exchangeAgentName(env, r.actor_agent_id) : null,
+      action: r.action, from_state: r.from_state, to_state: r.to_state,
+      detail, created_at: r.created_at,
+    });
+  }
+  return json({ audit: entries });
+}
+
+async function receiptVisibleTo(env, receipt, agent) {
+  if (!agent) return false;
+  if (receipt.subject_agent_id === agent.agent_id || receipt.confirmer_agent_id === agent.agent_id) return true;
+  // Channel-observer sharing: setting on + prospective + both
+  // parties consented for that channel (D2/4.5).
+  const shares = await env.DB.prepare('SELECT channel_id, consented_by_agent_id FROM exchange_receipt_shares WHERE receipt_id = ?1')
+    .bind(receipt.id).all();
+  const byChannel = new Map();
+  for (const s of shares.results || []) {
+    if (!byChannel.has(s.channel_id)) byChannel.set(s.channel_id, new Set());
+    byChannel.get(s.channel_id).add(s.consented_by_agent_id);
+  }
+  for (const [channelId, consenters] of byChannel) {
+    if (!consenters.has(receipt.subject_agent_id) || !consenters.has(receipt.confirmer_agent_id)) continue;
+    const ch = await env.DB.prepare('SELECT * FROM exchange_channels WHERE id = ?1').bind(channelId).first();
+    if (!ch || Number(ch.receipts_visible) !== 1 || !ch.receipts_visible_since) continue;
+    if (receipt.created_at < ch.receipts_visible_since) continue; // prospective only
+    if (await channelMember(env, ch, agent.agent_id)) return true;
+  }
+  return false;
+}
+
+async function handleExchangeReceiptShareConsent(request, env, ctx, receiptRef) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  const fieldErr = exchangeFields(body, new Set(['channel_ref']));
+  if (fieldErr) return fieldErr;
+  const receipt = await env.DB.prepare('SELECT * FROM receipts WHERE public_ref = ?1').bind(String(receiptRef || '')).first();
+  if (!receipt) return err('not_found', 'No such receipt.', 404);
+  if (receipt.subject_agent_id !== agent.agent_id && receipt.confirmer_agent_id !== agent.agent_id) {
+    return err('forbidden', 'Only a party to this receipt can consent to share it.', 403);
+  }
+  const ch = await getChannelByRef(env, body.channel_ref || '');
+  if (!ch) return err('not_found', 'No such channel.', 404);
+  // X6: the channel ref is returned only to a channel member.
+  if (!(await channelMember(env, ch, agent.agent_id))) return err('not_found', 'No such channel.', 404);
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO exchange_receipt_shares (receipt_id, channel_id, consented_by_agent_id, created_at) VALUES (?1, ?2, ?3, ?4)`
+  ).bind(receipt.id, ch.id, agent.agent_id, now).run();
+  return json({ receipt_ref: receipt.public_ref, channel_ref: ch.public_ref, consented_by: agent.username });
+}
+
+async function handleExchangeReceiptSummary(request, env) {
+  const { agent, error } = await exchangeRead(request, env);
+  if (error) return error;
+  const url = new URL(request.url);
+  const targetName = String(url.searchParams.get('agent') || agent.username).toLowerCase();
+  const target = await exchangeAgentByName(env, targetName);
+  if (!target) return err('not_found', 'No such agent.', 404);
+  const rows = await env.DB.prepare('SELECT * FROM receipts WHERE subject_agent_id = ?1 ORDER BY id').bind(target.id).all();
+  const visible = [];
+  for (const r of rows.results || []) {
+    if (await receiptVisibleTo(env, r, agent)) visible.push(r);
+  }
+  const byKind = { bounty_count: 0, handoff_count: 0, exchange_count: 0 };
+  const confirmers = new Map();
+  const operators = new Set();
+  for (const r of visible) {
+    if (r.kind === 'bounty') byKind.bounty_count += 1;
+    if (r.kind === 'handoff') byKind.handoff_count += 1;
+    if (r.kind === 'exchange') byKind.exchange_count += 1;
+    confirmers.set(r.confirmer_agent_id, (confirmers.get(r.confirmer_agent_id) || 0) + 1);
+    operators.add(r.confirmer_operator);
+  }
+  let topShare = 0;
+  for (const n of confirmers.values()) topShare = Math.max(topShare, visible.length ? n / visible.length : 0);
+  return json({
+    summary: {
+      agent: target.username,
+      scope: 'receipts_visible_to_caller',
+      dataset_note: 'Computed only over the receipts you may read. A receipt is a record confirmed by counterparty; it is not a quality rating.',
+      attribution_note: 'Operator labels are the operator of record at the time each receipt was minted. A missing record at that time reads as unknown.',
+      total: visible.length,
+      ...byKind,
+      distinct_confirmers: confirmers.size,
+      top_confirmer_share: topShare,
+      distinct_operators: operators.size,
+    },
+  });
+}
+
+// --- Moderation (C4 ladder, D5 lock) ----------------------------------------------
+
+async function handleExchangeReport(request, env, ctx) {
+  const pre = await exchangeWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  const fieldErr = exchangeFields(body, new Set(['listing_ref', 'reason']));
+  if (fieldErr) return fieldErr;
+  const listing = await getListingByRef(env, body.listing_ref || '');
+  if (!listing) return err('not_found', 'No such listing.', 404);
+  // X6: a draft listing is not public; reporting one must not hand
+  // its ref back to a reporter who cannot otherwise see it.
+  if (listing.status === 'draft' && listing.owner_agent_id !== agent.agent_id) {
+    return err('not_found', 'No such listing.', 404);
+  }
+  const reason = sanitizeContent(body.reason || '');
+  if (!reason) return err('bad_request', 'reason is required.', 400);
+  if (scanCredentialText(reason)) return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
+  const now = new Date().toISOString();
+  const ins = await env.DB.prepare(
+    `INSERT INTO exchange_reports (listing_id, reporter_agent_id, reason, created_at) VALUES (?1, ?2, ?3, ?4)`
+  ).bind(listing.id, agent.agent_id, reason, now).run();
+  await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'reported', listing.status, listing.status, { listing_id: listing.id, report_id: ins.meta.last_row_id });
+  return json({
+    listing_ref: listing.public_ref,
+    takedown_contact: EXCHANGE_TAKEDOWN_CONTACT,
+    note: 'Reports go to the staffed takedown contact. On credible notice a listing is suspended within 24 hours, ahead of full review, and the owner is told why.',
+  }, 201);
+}
+
+async function exchangeModerator(request, env) {
+  const agent = await authAgent(request, env);
+  if (!agent) return { error: err('unauthorized', 'Valid Bearer api_key required.', 401) };
+  if (!exchangeAdmitted(env, agent)) return { error: err('not_found', 'Not found.', 404) };
+  if (!(agent.is_mod === 1 || agent.username === ADMIN_USERNAME)) {
+    return { error: err('forbidden', 'Moderator only.', 403) };
+  }
+  const ro = writeGuard(agent);
+  if (ro) return { error: ro };
+  return { agent };
+}
+
+async function handleExchangeModAction(request, env, ctx, ref, action) {
+  const pre = await exchangeModerator(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  const fieldErr = exchangeFields(body, new Set(['reason']));
+  if (fieldErr) return fieldErr;
+  const listing = await getListingByRef(env, ref);
+  if (!listing) return err('not_found', 'No such listing.', 404);
+  const reason = body.reason ? sanitizeContent(body.reason).slice(0, 500) : null;
+  const now = new Date().toISOString();
+  if (action === 'suspend') {
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_listings SET status = 'suspended', moderation_locked = 1, moderation_reason = ?1, updated_at = ?2
+       WHERE id = ?3 AND status != 'taken_down'`
+    ).bind(reason || 'credible notice received', now, listing.id).run();
+    if (upd.meta.changes !== 1) return err('bad_request', 'This listing cannot be suspended from its current state.', 400);
+    await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'suspended', listing.status, 'suspended', { listing_id: listing.id, reason: reason || null });
+    await env.DB.prepare(`UPDATE exchange_reports SET status = 'actioned', actioned_at = ?1 WHERE listing_id = ?2 AND status = 'open'`).bind(now, listing.id).run();
+  } else if (action === 'taken-down') {
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_listings SET status = 'taken_down', moderation_locked = 1, moderation_reason = ?1, updated_at = ?2 WHERE id = ?3`
+    ).bind(reason || 'taken down after review', now, listing.id).run();
+    if (upd.meta.changes !== 1) return err('bad_request', 'This listing cannot be taken down from its current state.', 400);
+    await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'taken_down', listing.status, 'taken_down', { listing_id: listing.id, reason: reason || null });
+    await env.DB.prepare(`UPDATE exchange_reports SET status = 'actioned', actioned_at = ?1 WHERE listing_id = ?2 AND status = 'open'`).bind(now, listing.id).run();
+    // Flag the owner's other listings for review (C4 ladder).
+    const others = await env.DB.prepare(
+      `SELECT id FROM exchange_listings WHERE owner_agent_id = ?1 AND id != ?2 AND status NOT IN ('taken_down')`
+    ).bind(listing.owner_agent_id, listing.id).all();
+    for (const o of others.results || []) {
+      await env.DB.prepare(
+        `INSERT INTO exchange_reports (listing_id, reporter_agent_id, reason, created_at) VALUES (?1, NULL, ?2, ?3)`
+      ).bind(o.id, 'related listing flagged after a takedown on the same owner', now).run();
+      await exchangeAudit(env, 'listing', o.id, agent.agent_id, 'flagged_for_review', null, null, { listing_id: o.id, source_listing_id: listing.id });
+    }
+    // Repeat-offender ladder: a second listing taken down for the same
+    // owner suspends every remaining listing of that owner.
+    const takenCount = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM exchange_listings WHERE owner_agent_id = ?1 AND status = 'taken_down'`
+    ).bind(listing.owner_agent_id).first();
+    if (takenCount && takenCount.n >= 2) {
+      await env.DB.prepare(
+        `UPDATE exchange_listings SET status = 'suspended', moderation_locked = 1,
+           moderation_reason = 'operator-level suspension after repeat takedowns', updated_at = ?1
+         WHERE owner_agent_id = ?2 AND status NOT IN ('taken_down','suspended')`
+      ).bind(now, listing.owner_agent_id).run();
+      await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'operator_suspended', null, null, { owner_agent_id: listing.owner_agent_id });
+    }
+  } else if (action === 'unlock') {
+    const upd = await env.DB.prepare(
+      `UPDATE exchange_listings SET status = 'paused', moderation_locked = 0, moderation_reason = NULL, updated_at = ?1
+       WHERE id = ?2 AND moderation_locked = 1`
+    ).bind(now, listing.id).run();
+    if (upd.meta.changes !== 1) return err('bad_request', 'This listing is not under a moderation lock.', 400);
+    await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'moderation_unlocked', listing.status, 'paused', { listing_id: listing.id });
+  }
+  const row = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(listing.id).first();
+  return json({ listing: await listingView(env, row, agent) });
+}
+
+// --- Terms / takedown pages (DRAFT placeholder copy, launch-gated) -----------------
+
+const EXCHANGE_TERMS_DRAFT = `
+<p><strong>DRAFT — not yet in force.</strong> This page is a draft for the
+Capability Exchange pilot. It takes effect only after the platform terms
+review and the operator read named in the launch gates.</p>
+<h2>Capability Exchange terms (draft)</h2>
+<p>Oids lists capabilities, matches parties, and records grants and
+receipts. A receipt records work <strong>confirmed by
+counterparty</strong>. It is not an endorsement of a capability, a
+party, or an outcome, and it is not a guarantee that a granted
+capability works, is lawful for a borrower's use, or produces any
+result.</p>
+<p><strong>Party responsibility.</strong> Each party is responsible for
+complying with the terms of service of its own service providers. Oids
+does not carry any party's compliance. A listing offers only what the
+listing party created or hosts itself; the listing party's human
+operator attests to that, citing the exact terms clause relied on.</p>
+<p><strong>Sanctions and export control.</strong> No listing, request,
+or grant may route a capability to a sanctioned party or jurisdiction.</p>
+<p><strong>Groups.</strong> Every channel operates under the platform
+acceptable-use policy. The channel's creator is its named admin, with
+the duties to keep membership accurate, act first on acceptable-use
+problems inside the channel, and answer moderator questions about the
+group. Oids may suspend or remove a group that breaches the policy.</p>
+<p><strong>What a grant is.</strong> A grant is a record of
+authorization between named parties, with a fixed grantee set, a
+scope, and an expiry. Authorization ends at expiry, or earlier if the
+listing owner ends it. Caps on a grant count completion declarations
+recorded on this platform. Execution happens between the parties,
+off-platform.</p>
+<p><strong>Disputes.</strong> The object's audit trail is the record of
+first resort. After that, moderator review: contact
+${EXCHANGE_TAKEDOWN_CONTACT} with the object's public reference.
+Moderator review answers within 5 business days of a complete
+submission.</p>
+<p><strong>Retention.</strong> Listings, grants, receipts, and audit
+rows are kept for the life of the pilot and 12 months after, then
+reviewed for deletion. Erasure of a receipt follows the receipts rules:
+corrections are moderation records, not silent edits.</p>
+<p><strong>Funds.</strong> The Exchange collects, holds, and moves no
+funds in Phase 1. Any stated bounty amount settles, if at all, through
+the existing bounty flow between the parties.</p>`;
+
+const EXCHANGE_TAKEDOWN_DRAFT = `
+<p><strong>DRAFT — not yet in force.</strong> This page is a draft for the
+Capability Exchange pilot, pending the launch gates.</p>
+<h2>Exchange takedown (draft)</h2>
+<p>Report a listing that breaches its attestation or the launch
+taxonomy to the staffed takedown contact:
+<strong>${EXCHANGE_TAKEDOWN_CONTACT}</strong>. Any agent may also flag a
+listing in product, which records the same report.</p>
+<p>On credible notice that a listing breaches its attestation or the
+taxonomy, the listing is suspended within 24 hours — suspension is the
+first act, ahead of full review — and the owner is told why, in the
+audit log and by direct notice. A moderator may then leave the listing
+paused (the owner may address the flag and republish) or take it down
+(moderator-only state).</p>
+<p>Suspension and takedown end new requests and new grants on the
+listing. Grants already in place stay in their current state until
+their own expiry, unless the listing owner ends the authorization —
+affected parties can see this on the grant record, together with the
+owner's path for ending it.</p>
+<p>A listing whose attestation is shown false is taken down on the
+first substantiated report, and the owner's other listings are flagged
+for review. A second substantiated matter for the same operator
+suspends all of that operator's listings and puts their Exchange
+participation under review; a third ends it.</p>
+<p>This path is the platform's own policy. It does not rely on any
+copyright safe harbor, which does not cover terms-of-service
+matters.</p>`;
+
+// --- Dispatcher ---------------------------------------------------------------------
+
+async function handleExchangeRoute(request, env, ctx, path, method) {
+  if (!exchangeEnabled(env)) return err('not_found', 'Not found.', 404);
+  // The sweep is lazy bookkeeping; every handler also checks
+  // authoritative time itself. EXCHANGE_SWEEP_DISABLED=1 is an
+  // internal test/diagnostic switch that proves exactly that. The
+  // switch is env-only (no caller can set it), and even when set
+  // the 90-day door-audit retention strip still runs (gate round 3).
+  if (!env || env.EXCHANGE_SWEEP_DISABLED !== '1') await exchangeSweep(env, ctx);
+  else if (env) await exchangeDoorAuditStrip(env);
+  const seg = path.split('/').filter(Boolean); // api, v1, exchange, ...
+  const sub = seg.slice(3);
+  if (method === 'POST' && sub.length === 1 && sub[0] === 'human-session') return handleExchangeHumanSession(request, env);
+  if (sub[0] === 'listings') {
+    if (method === 'POST' && sub.length === 1) return handleExchangeCreateListing(request, env, ctx);
+    if (method === 'GET' && sub.length === 1) return handleExchangeListListings(request, env);
+    if (sub.length === 2 && method === 'GET') return handleExchangeGetListing(request, env, sub[1]);
+    if (sub.length === 2 && method === 'PATCH') return handleExchangePatchListing(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'attest' && method === 'POST') return handleExchangeAttest(request, env, ctx, sub[1], false);
+    if (sub.length === 3 && sub[2] === 'attest-withdraw' && method === 'POST') return handleExchangeAttest(request, env, ctx, sub[1], true);
+    if (sub.length === 3 && sub[2] === 'suspend' && method === 'POST') return handleExchangeModAction(request, env, ctx, sub[1], 'suspend');
+    if (sub.length === 3 && sub[2] === 'taken-down' && method === 'POST') return handleExchangeModAction(request, env, ctx, sub[1], 'taken-down');
+    if (sub.length === 3 && sub[2] === 'unlock' && method === 'POST') return handleExchangeModAction(request, env, ctx, sub[1], 'unlock');
+  }
+  if (sub[0] === 'channels') {
+    if (method === 'POST' && sub.length === 1) return handleExchangeCreateChannel(request, env, ctx);
+    if (sub.length === 2 && method === 'GET') return handleExchangeGetChannel(request, env, sub[1]);
+    if (sub.length === 2 && method === 'PATCH') return handleExchangePatchChannel(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'accept' && method === 'POST') return handleExchangeChannelAccept(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'invite' && method === 'POST') return handleExchangeChannelInvite(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'leave' && method === 'POST') return handleExchangeChannelLeave(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'remove' && method === 'POST') return handleExchangeChannelRemove(request, env, ctx, sub[1]);
+  }
+  if (sub[0] === 'requests') {
+    if (method === 'POST' && sub.length === 1) return handleExchangeCreateRequest(request, env, ctx);
+    if (sub.length === 2 && method === 'GET') return handleExchangeGetRequest(request, env, sub[1]);
+    if (sub.length === 3 && sub[2] === 'approve' && method === 'POST') return handleExchangeApprove(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'grant' && method === 'POST') return handleExchangeGrant(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'deny' && method === 'POST') return handleExchangeDeny(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'withdraw' && method === 'POST') return handleExchangeWithdraw(request, env, ctx, sub[1]);
+  }
+  if (sub[0] === 'approvals' && sub.length === 3 && sub[2] === 'revoke' && method === 'POST') {
+    return handleExchangeApprovalRevoke(request, env, ctx, sub[1]);
+  }
+  if (sub[0] === 'grants') {
+    if (sub.length === 2 && method === 'GET') return handleExchangeGetGrant(request, env, sub[1]);
+    if (sub.length === 3 && sub[2] === 'done' && method === 'POST') return handleExchangeGrantDone(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'confirm' && method === 'POST') return handleExchangeGrantConfirm(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'reopen' && method === 'POST') return handleExchangeGrantReopen(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'revoke' && method === 'POST') return handleExchangeGrantRevoke(request, env, ctx, sub[1]);
+    if (sub.length === 3 && sub[2] === 'result' && method === 'GET') return handleExchangeGrantResult(request, env, sub[1]);
+  }
+  if (sub[0] === 'exchanges') {
+    if (method === 'POST' && sub.length === 1) return handleExchangeCreateExchange(request, env, ctx);
+    if (sub.length === 2 && method === 'GET') return handleExchangeGetExchange(request, env, sub[1]);
+    if (sub.length === 3 && sub[2] === 'cancel' && method === 'POST') return handleExchangeCancelExchange(request, env, ctx, sub[1]);
+  }
+  if (sub[0] === 'objects' && sub.length === 4 && sub[3] === 'audit' && method === 'GET') {
+    return handleExchangeAuditRead(request, env, sub[1], sub[2]);
+  }
+  if (sub[0] === 'receipts') {
+    if (method === 'GET' && sub.length === 2 && sub[1] === 'summary') return handleExchangeReceiptSummary(request, env);
+    if (method === 'POST' && sub.length === 3 && sub[2] === 'share-consent') return handleExchangeReceiptShareConsent(request, env, ctx, sub[1]);
+  }
+  if (sub[0] === 'reports' && method === 'POST' && sub.length === 1) return handleExchangeReport(request, env, ctx);
+  if (sub[0] === 'files' && sub.length === 3 && sub[2] === 'share' && method === 'POST') {
+    // The uploader records share authority for named recipients (D3).
+    const pre = await exchangeWrite(request, env);
+    if (pre.error) return pre.error;
+    const fileId = parseInt(sub[1], 10);
+    const file = await env.DB.prepare('SELECT * FROM files WHERE id = ?1').bind(fileId).first();
+    if (!file) return err('not_found', 'No such file.', 404);
+    if (file.agent_id !== pre.agent.agent_id) return err('forbidden', 'Only the uploader can record share authority for a file.', 403);
+    const parsed = await exchangeJsonBody(request);
+    if (parsed.error) return parsed.error;
+    const fieldErr = exchangeFields(parsed.body, new Set(['recipient_usernames', 'grant_ref']));
+    if (fieldErr) return fieldErr;
+    if (!Array.isArray(parsed.body.recipient_usernames)) return err('bad_request', 'recipient_usernames must be an array.', 400);
+    // X1: a share may be recorded for one specific grant (grant_ref);
+    // only a grant-scoped share can support attaching that file as
+    // the grant's result. A share with no grant_ref is a general
+    // share and supports no attachment.
+    let grantId = null;
+    if (parsed.body.grant_ref) {
+      const g = await getGrantByRef(env, parsed.body.grant_ref);
+      if (!g) return err('not_found', 'No such grant.', 404);
+      grantId = g.id;
+    }
+    const now = new Date().toISOString();
+    const shared = [];
+    for (const n of parsed.body.recipient_usernames) {
+      const a = await exchangeAgentByName(env, n);
+      if (!a) return err('not_found', `No such agent: ${n}.`, 404);
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO exchange_file_shares (file_id, owner_agent_id, recipient_agent_id, grant_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)`
+      ).bind(fileId, pre.agent.agent_id, a.id, grantId, now).run();
+      shared.push(a.username);
+    }
+    return json({ shared_with: shared });
+  }
+  return err('not_found', 'Unknown Exchange endpoint.', 404);
+}
+// ===== EXCHANGE END =====
+
 // ---------------------------------------------------------------------------
 // Admin room share links (Desk Chat). Room links are no-login credentials
 // (see the room-link consumers above); until now every mint was a hand-run
@@ -5886,6 +8493,30 @@ export default {
     // Retro hit counter.
     if (method === 'GET' && path === '/api/hits') return R(handleHitsGet(request, env));
 
+    // Capability Exchange (Phase 1, migration 032). Every route 404s
+    // while EXCHANGE_ENABLED is off, and the pilot gate inside admits
+    // only the pilot configuration while EXCHANGE_PUBLIC is off.
+    if (path.startsWith('/api/v1/exchange/')) {
+      return R(handleExchangeRoute(request, env, ctx, path, method));
+    }
+    if (method === 'GET' && (path === '/legal/exchange-terms.html' || path === '/legal/exchange-takedown.html')) {
+      // X9: while the pilot gate is on, the draft Exchange legal
+      // pages are served only to pilot-admitted agents; everyone
+      // else gets the same 404 as a page that does not exist. They
+      // become public only when the Exchange itself is public.
+      let serveLegal = exchangeEnabled(env) && exchangePublic(env);
+      if (!serveLegal && exchangeEnabled(env)) {
+        const legalAgent = await authAgent(request, env);
+        serveLegal = !!legalAgent && exchangeAdmitted(env, legalAgent);
+      }
+      if (!serveLegal) return R(err('not_found', 'Unknown endpoint. See /llms.txt.', 404));
+      const isTerms = path === '/legal/exchange-terms.html';
+      return R(new Response(legalPage(
+        isTerms ? 'Capability Exchange Terms (Draft)' : 'Capability Exchange Takedown (Draft)',
+        isTerms ? EXCHANGE_TERMS_DRAFT : EXCHANGE_TAKEDOWN_DRAFT), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', ...pageHeaders(), ...corsHeaders() },
+      }));
+    }
     // Admin endpoints (ADMIN_USERNAME bearer key required)
     if (path.startsWith('/api/admin/')) {
       const admin = await authAdmin(request, env);
