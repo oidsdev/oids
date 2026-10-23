@@ -6212,6 +6212,22 @@ async function handleExchangePatchListing(request, env, ctx, ref) {
   if (scanCredentialFields([next.title, next.description, next.limits_json])) {
     return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
   }
+  // D2 (Doors stack): a title/description edit through this PATCH on
+  // a listing that carries a door re-runs all three door screens —
+  // the door terms screen, the barred-name screen, and the
+  // impersonation screen — before anything is stored.
+  if (typeof doorNameScreen === 'function' && (body.title !== undefined || body.description !== undefined)) {
+    let doorRow = null;
+    try { doorRow = await env.DB.prepare('SELECT * FROM doors WHERE listing_id = ?1').bind(listing.id).first(); } catch { doorRow = null; }
+    if (doorRow) {
+      const wager = doorWagerScreen([next.title, next.description, doorRow.display_tag]);
+      if (wager) {
+        return err('door_terms_violation', 'Doors may not offer wagering, paid entry, or prizes of value awarded by chance. The edited listing text names a barred term, so the edit was not stored.', 400);
+      }
+      const nameProblem = await doorNameScreen(env, doorRow.slug, next.title, agent.agent_id);
+      if (nameProblem) return err('bad_door_name', nameProblem, 400);
+    }
+  }
   let nextStatus = listing.status;
   if (body.status !== undefined) {
     const v = String(body.status);
@@ -6230,6 +6246,18 @@ async function handleExchangePatchListing(request, env, ctx, ref) {
       }
     }
     nextStatus = v;
+  }
+  if (typeof doorsEnabled === 'function' && doorsEnabled(env) && nextStatus === 'live' && listing.status !== 'live') {
+    const doorRow = await env.DB.prepare('SELECT listing_id FROM doors WHERE listing_id = ?1').bind(listing.id).first();
+    if (doorRow) {
+      const capStatus = await doorCapStatus(env, listing.owner_agent_id);
+      // The listing is not live yet in this branch, so the operator's
+      // current live-door count is the count this transition would add to.
+      const effectiveCount = capStatus.count;
+      if (effectiveCount >= capStatus.cap) {
+        return err('door_cap_reached', `This operator already has ${effectiveCount} live door(s); the limit for this operator is ${capStatus.cap} live door(s)${capStatus.inFirstWeek ? ' during the operator\'s first 7 days' : ''}.`, 400);
+      }
+    }
   }
   const nextRevision = material ? Number(listing.revision) + 1 : Number(listing.revision);
   const nextAttestation = material ? (listing.attestation === 'attested' ? 'stale' : listing.attestation) : listing.attestation;
@@ -8046,6 +8074,946 @@ async function handleExchangeRoute(request, env, ctx, path, method) {
 }
 // ===== EXCHANGE END =====
 
+
+// ===== DOORS BEGIN =====
+// Oids Doors MVP — a presentation and entry layer over the Capability
+// Exchange (Phase 1, migration 032). A Door is an Exchange listing
+// (migration 033) with door fields; this block adds no parallel
+// registry and reuses the Exchange attestation, audience, grants,
+// receipts, and audit machinery unchanged. Entry tokens are minted
+// from grants (grant mode) or from audience standing (open mode).
+// A receipt is a record only; nothing in this block reads a receipt
+// to decide any entry, validation, or access question.
+// Receipt wording in this feature follows the Exchange rule:
+// "confirmed by counterparty". Session and grant ending copy says
+// authorization ended or was withdrawn; this platform closes its
+// own records and cannot end a session on an operator's side.
+// ---------------------------------------------------------------------------
+
+const DOOR_TOKEN_TTL_MS = 5 * 60000; // DQ2: presentation window is 5 minutes
+const DOOR_SESSION_HARD_MAX_MINUTES = 1440; // DQ2: 24h session record cap
+const DOOR_ENTRY_RETENTION_DAYS = 90; // retention rule: see migration 033 header
+const DOOR_NOTICE = 'External site, not Oids. The service behind this door runs on the operator\'s own infrastructure. Never send your Oids key to a door: a door never needs it, and Oids will never ask for it inside a door.';
+const DOOR_OPEN_NOTICE = 'Open door: entry needs no grant, and no human approval occurred for entry. The listing audience still bounds who may enter.';
+const DOOR_SESSION_HONESTY = 'Oids records the entry and closes its own session record at the cap. Oids cannot end a session on the operator\'s infrastructure.';
+const DOOR_DISPLAY_TAGS = new Set(['game', 'tool', 'world', 'data', 'service']);
+const DOOR_SHORTENER_DOMAINS = new Set([
+  'bit.ly', 'tinyurl.com', 't.co', 'goo.gl', 'rb.gy', 'is.gd', 'buff.ly',
+  'ow.ly', 'tiny.cc', 'cutt.ly', 'rebrand.ly', 'shorturl.at', 'v.gd',
+  'x.co', 'qr.ae', 's.id', 'bl.ink', 'short.io', 'lnkd.in', 'fb.me',
+  'bitly.com', 'j.mp', 'linktr.ee', 'surl.li', 'lnk.to',
+]);
+const DOOR_MULTI_LABEL_SUFFIXES = new Set([
+  'co.uk', 'org.uk', 'ac.uk', 'com.au', 'net.au', 'org.au', 'co.nz',
+  'com.br', 'com.cn', 'com.tw', 'co.jp', 'co.kr', 'com.mx', 'co.in',
+  'com.sg', 'com.hk', 'co.za',
+]);
+// D3: private-section suffixes of the public suffix list. A tenant
+// name under one of these is its own registrable domain, so two
+// owners on one platform suffix are two different domains.
+const DOOR_PRIVATE_SUFFIXES = new Set([
+  'github.io', 'gitlab.io', 'pages.dev', 'workers.dev', 'vercel.app',
+  'netlify.app', 'herokuapp.com', 'azurewebsites.net', 'appspot.com',
+  'firebaseapp.com', 'web.app', 'surge.sh', 'onrender.com', 'fly.dev',
+  'glitch.me', 'replit.app', 'blogspot.com', 'wordpress.com',
+]);
+// Fragments of names this feature must never ship or accept, assembled
+// in pieces so the full names appear in no shipped string.
+const DOOR_BANNED_NAME_FRAGMENTS = [
+  'trade' + 'wars',
+  'legendofthered' + 'dragon',
+  'red' + 'dragon',
+  'lord' + 'ofthereddragon',
+];
+const DOOR_WAGER_TERMS = [
+  'wagering', 'gambling', 'casino', 'lottery', 'raffle', 'sweepstakes',
+  'slot machine', 'bookmaker', 'betting', 'paid entry', 'entry fee',
+  'prize awarded by chance', 'prizes of value awarded by chance',
+];
+
+function doorsEnabled(env) {
+  const v = env && env.DOORS_ENABLED;
+  const on = v === '1' || v === 'true' || v === true;
+  return on && exchangeEnabled(env);
+}
+function doorRegistrableDomain(host) {
+  const parts = String(host || '').toLowerCase().split('.').filter(Boolean);
+  if (parts.length <= 2) return parts.join('.');
+  const last2 = parts.slice(-2).join('.');
+  if (DOOR_MULTI_LABEL_SUFFIXES.has(last2) || DOOR_PRIVATE_SUFFIXES.has(last2)) {
+    return parts.slice(-3).join('.');
+  }
+  return last2;
+}
+function doorIsIpLiteral(host) {
+  const h = String(host || '');
+  if (h.includes(':')) return true; // IPv6 literal (brackets stripped by URL parsing)
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(h);
+}
+/** Condition 2: https only, no IP literals, no private/local names, no
+ *  Oids domains, no shortener/redirector domains. Returns {href, host,
+ *  domain} or {error}. */
+function doorCheckEntryUrl(raw) {
+  const rawStr = String(raw || '');
+  // D1 (gate round 3): a backslash is a separator to the URL parser
+  // but not to a naive authority split, which is how backslash forms
+  // slipped the round-2 pre-check. An entry URL never legitimately
+  // contains one: refuse outright.
+  if (rawStr.includes('\\')) return { error: 'entry_url must not contain backslashes.' };
+  // D1: reject percent-encoded characters in the authority segment
+  // before parsing, so an encoded host can never slip a dotted or
+  // obfuscated variant past the checks below.
+  const hostPart = rawStr.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[/?#]/)[0];
+  if (hostPart.includes('%')) return { error: 'entry_url host must not carry encoded characters.' };
+  let u;
+  try { u = new URL(rawStr); } catch { return { error: 'entry_url must be a valid https URL.' }; }
+  if (u.protocol !== 'https:') return { error: 'entry_url must be https.' };
+  if (u.username || u.password) return { error: 'entry_url must not carry credentials.' };
+  // D1 (gate round 3): every check runs on the FINAL parsed
+  // hostname, and a host that ends in a dot or carries an empty
+  // label is REJECTED, never normalized — tryoids.com.. ,
+  // localhost.. and 127.0.0.1.. fail here instead of being stripped
+  // to the bare blocked host (round 2 stripped exactly one dot).
+  const host = u.hostname.toLowerCase();
+  if (!host || !host.includes('.')) return { error: 'entry_url must name a public host.' };
+  if (host.split('.').some((label) => label === '')) {
+    return { error: 'entry_url host must not end in a dot or contain an empty label.' };
+  }
+  if (doorIsIpLiteral(host)) return { error: 'entry_url must not be an IP literal; use a public https host name.' };
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan') || host.endsWith('.home')) {
+    return { error: 'entry_url must not name a private or local host.' };
+  }
+  if (host === 'tryoids.com' || host.endsWith('.tryoids.com')) {
+    return { error: 'entry_url must be on the operator\'s own infrastructure, not an Oids domain.' };
+  }
+  const domain = doorRegistrableDomain(host);
+  if (DOOR_SHORTENER_DOMAINS.has(domain) || DOOR_SHORTENER_DOMAINS.has(host)) {
+    return { error: 'entry_url must not use a link shortener or redirector; register the destination URL itself.' };
+  }
+  return { href: u.href, host, domain };
+}
+function doorNormalizedName(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+/** Slug/title screen (conditions 5 and 6): reserved and impersonation
+ *  names, operator handles, and names of existing door games. */
+async function doorNameScreen(env, slug, title, ownerAgentId) {
+  const slugNorm = doorNormalizedName(slug);
+  for (const frag of DOOR_BANNED_NAME_FRAGMENTS) {
+    if (slugNorm.includes(frag) || doorNormalizedName(title).includes(frag)) {
+      return 'That name uses the name of an existing door game, which doors may not use.';
+    }
+  }
+  if (RESERVED_USERNAMES.has(String(slug || '').toLowerCase()) || slugNorm.startsWith('oids') || slugNorm.includes('oidsadmin')) {
+    return 'That slug is reserved or impersonation-adjacent.';
+  }
+  if (/(signin|login|official|password|apikey)/.test(slugNorm) && slugNorm.includes('oids')) {
+    return 'That slug is impersonation-adjacent.';
+  }
+  // D2: official-style names fail in their own right. A slug built on
+  // the platform's own tryoids name, or any slug/title pairing the
+  // platform name with a support/official word, reads as the
+  // platform speaking, which a door may not imitate.
+  if (slugNorm.startsWith('tryoids') || slugNorm === 'tryoids') {
+    return 'That slug is impersonation-adjacent.';
+  }
+  if (slugNorm.includes('oids') && /(support|helpdesk|official|team|admin|verify|security)/.test(slugNorm)) {
+    return 'That slug is impersonation-adjacent.';
+  }
+  const titleNorm = doorNormalizedName(title);
+  if ((titleNorm.includes('oids')) && /(signin|sign in|log in|login|official|password)/.test(String(title || '').toLowerCase())) {
+    return 'That name reads as an Oids sign-in or official page, which a door may not imitate.';
+  }
+  if (titleNorm.includes('oids') && /(support|help desk|helpdesk|official|team|admin|verify|security)/.test(String(title || '').toLowerCase())) {
+    return 'That name reads as an official Oids page or channel, which a door may not imitate.';
+  }
+  if (titleNorm.startsWith('tryoids')) {
+    return 'That name reads as an official Oids page or channel, which a door may not imitate.';
+  }
+  const agents = await env.DB.prepare('SELECT id, username FROM agents').all();
+  for (const a of agents.results || []) {
+    if (slugNorm === doorNormalizedName(a.username)) {
+      return 'That slug is an agent handle; door slugs may not impersonate a handle.';
+    }
+    if (a.id !== ownerAgentId && titleNorm === doorNormalizedName(a.username)) {
+      return 'That name is another operator\'s handle; door names may not impersonate a handle.';
+    }
+  }
+  return null;
+}
+function doorWagerScreen(values) {
+  const text = values.map((v) => String(v || '').toLowerCase()).join(' \n ');
+  for (const term of DOOR_WAGER_TERMS) {
+    if (text.includes(term)) return term;
+  }
+  return null;
+}
+
+async function doorOperatorId(env, agentId) {
+  const row = await env.DB.prepare('SELECT operator_id FROM agent_operators WHERE agent_id = ?1').bind(agentId).first();
+  return row ? String(row.operator_id) : ('agent-' + agentId);
+}
+async function doorOperatorAgentIds(env, agentId) {
+  const op = await doorOperatorId(env, agentId);
+  if (op.startsWith('agent-')) return [agentId];
+  const rows = await env.DB.prepare('SELECT agent_id FROM agent_operators WHERE operator_id = ?1').bind(op).all();
+  const ids = (rows.results || []).map((r) => r.agent_id);
+  return ids.length ? ids : [agentId];
+}
+/** DQ3 cap status for an operator of record: 5 live doors, and only 1
+ *  live door during the operator's first 7 days. Tenure is measured
+ *  from the current operator mapping's creation (Q3). */
+async function doorCapStatus(env, ownerAgentId) {
+  const ids = await doorOperatorAgentIds(env, ownerAgentId);
+  const ph = ids.map((_, i) => `?${i + 1}`).join(',');
+  const countRow = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM doors d JOIN exchange_listings l ON l.id = d.listing_id
+     WHERE l.owner_agent_id IN (${ph}) AND l.status = 'live'`
+  ).bind(...ids).first();
+  const count = countRow ? countRow.n : 0;
+  // Q3: tenure counts from the CURRENT operator mapping's creation
+  // (the earliest updated_at among the operator's current mapping
+  // rows). History under earlier operators is ignored, and a draft
+  // door does not start the clock: with no current mapping, tenure
+  // starts now.
+  let tenureStart = new Date().toISOString();
+  const op = await doorOperatorId(env, ownerAgentId);
+  if (!op.startsWith('agent-')) {
+    const m = await env.DB.prepare(
+      `SELECT MIN(updated_at) AS t FROM agent_operators WHERE operator_id = ?1`
+    ).bind(op).first();
+    if (m && m.t) tenureStart = m.t;
+  }
+  const inFirstWeek = (Date.now() - Date.parse(tenureStart)) < 7 * 86400000;
+  return { count, cap: inFirstWeek ? 1 : 5, inFirstWeek, tenureStart };
+}
+
+async function getDoorByListingId(env, listingId) {
+  return env.DB.prepare('SELECT * FROM doors WHERE listing_id = ?1').bind(listingId).first();
+}
+async function getDoorByRef(env, ref) {
+  const bySlug = await env.DB.prepare('SELECT * FROM doors WHERE slug = ?1').bind(String(ref || '')).first();
+  if (bySlug) {
+    const listing = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(bySlug.listing_id).first();
+    return listing ? { door: bySlug, listing } : null;
+  }
+  const listing = await getListingByRef(env, ref);
+  if (!listing) return null;
+  const door = await getDoorByListingId(env, listing.id);
+  return door ? { door, listing } : null;
+}
+
+/** Per-door counts: validated entries in the trailing 30 days, with
+ *  distinct operators beside the raw count (DQ5 / anti-wash). Callers
+ *  appear nowhere here; entry counts are counts, nothing more. */
+async function doorCounts(env, listingId) {
+  const since = new Date(Date.now() - 30 * 86400000).toISOString();
+  const rows = await env.DB.prepare(
+    `SELECT agent_id FROM door_entries WHERE door_listing_id = ?1 AND consumed_at IS NOT NULL AND consumed_at >= ?2`
+  ).bind(listingId, since).all();
+  const list = rows.results || [];
+  const ops = new Set();
+  for (const r of list) ops.add(await doorOperatorId(env, r.agent_id));
+  return { entry_count_30d: list.length, distinct_operators_30d: ops.size, window: 'trailing 30 days' };
+}
+
+function doorPitch(listing) {
+  const d = String(listing.description || '').trim();
+  const firstSentence = d.split(/(?<=[.!?])\s+/)[0] || d;
+  return firstSentence.slice(0, 200);
+}
+async function doorView(env, door, listing, viewer, { fullUrl = false } = {}) {
+  const counts = await doorCounts(env, listing.id);
+  const ownerName = await exchangeAgentName(env, listing.owner_agent_id);
+  let entryHost = null;
+  try { entryHost = new URL(door.entry_url).host; } catch { entryHost = null; }
+  const view = {
+    ref: listing.public_ref,
+    slug: door.slug,
+    name: listing.title,
+    pitch: doorPitch(listing),
+    operator: ownerName,
+    operator_handle: ownerName,
+    kind: listing.kind,
+    display_tag: door.display_tag || null,
+    entry_mode: door.entry_mode,
+    price_mode: listing.price_mode,
+    entry_url_host: entryHost,
+    session_max_minutes: door.session_max_minutes,
+    notice: DOOR_NOTICE,
+    session_note: DOOR_SESSION_HONESTY,
+    ...counts,
+    created_at: door.created_at,
+    updated_at: door.updated_at,
+  };
+  if (door.entry_mode === 'open') view.open_notice = DOOR_OPEN_NOTICE;
+  if (fullUrl) {
+    view.entry_url = door.entry_url;
+    // Opt-in callers only (DQ5): validated entries whose agent opted
+    // in at mint. No board-wide caller list exists in this feature.
+    const callers = await env.DB.prepare(
+      `SELECT agent_id, consumed_at FROM door_entries
+       WHERE door_listing_id = ?1 AND consumed_at IS NOT NULL AND opt_in_visible = 1
+       ORDER BY consumed_at DESC LIMIT 20`
+    ).bind(listing.id).all();
+    view.recent_callers = [];
+    for (const c of callers.results || []) {
+      view.recent_callers.push({ agent: await exchangeAgentName(env, c.agent_id), entered_at: c.consumed_at });
+    }
+  }
+  if (viewer && viewer.agent_id === listing.owner_agent_id) {
+    view.entry_domain = door.entry_domain;
+    view.validate_key_note = 'Validation and exit calls for this door use its per-door validate key, issued at registration and shown once. The operator\'s Oids API key is never used for those calls.';
+  }
+  return view;
+}
+
+/** Idempotency for door writes, with secret-bearing responses scrubbed
+ *  before storage: a minted token or validate key is shown once and
+ *  must not persist in the idempotency record (hash-only at rest is
+ *  the token rule). Replays return the scrubbed stored response: the
+ *  same object references, no second row, no second secret.
+ *  D5 reserve-first, same pattern as the Exchange: the key row is
+ *  claimed against the unique index BEFORE the work runs, so a
+ *  concurrent replay loses the race; non-2xx outcomes release the
+ *  reservation and are never recorded. */
+async function doorIdem(request, env, agent, operation, targetRef, body, scrub, fn) {
+  const key = request.headers.get('Idempotency-Key') || '';
+  if (!key || key.length > 128) {
+    return err('idempotency_key_required', 'Every Doors write requires an Idempotency-Key header (128 chars max).', 400);
+  }
+  const target = targetRef || '';
+  const payloadHash = await sha256hex(stableStringify(body || {}));
+  const prior = await env.DB.prepare(
+    `SELECT operation, target_ref, response_status, response_body, payload_hash, created_at FROM exchange_idempotency
+     WHERE actor_agent_id = ?1 AND idempotency_key = ?2`
+  ).bind(agent.agent_id, key).all();
+  const priorRows = prior.results || [];
+  const existing = priorRows.find((r) => r.operation === operation && r.target_ref === target);
+  if (priorRows.length && !existing) {
+    return err('idempotency_conflict', 'This Idempotency-Key was already used with a different payload, operation, or target.', 400);
+  }
+  if (existing && existing.response_status !== 0) {
+    if (existing.payload_hash !== payloadHash) {
+      return err('idempotency_conflict', 'This Idempotency-Key was already used with a different payload, operation, or target.', 400);
+    }
+    return json(JSON.parse(existing.response_body), existing.response_status);
+  }
+  if (existing) {
+    // Same rule as the Exchange stack (gate round 3): a status-0
+    // reservation past its short TTL counts as free — its isolate
+    // died before recording — and is dropped so the retry below
+    // can claim the key fresh. A live reservation still wins.
+    const ageMs = Date.now() - Date.parse(existing.created_at || '');
+    if (!(Number.isFinite(ageMs) && ageMs > EXCHANGE_IDEM_PLACEHOLDER_TTL_MS)) {
+      return err('idempotency_conflict', 'This Idempotency-Key is already in use by a concurrent request.', 409);
+    }
+    try {
+      await env.DB.prepare(
+        `DELETE FROM exchange_idempotency WHERE actor_agent_id = ?1 AND operation = ?2 AND target_ref = ?3 AND idempotency_key = ?4 AND response_status = 0`
+      ).bind(agent.agent_id, operation, target, key).run();
+    } catch { /* if the drop loses a race, the claim below answers 409 */ }
+  }
+  try {
+    await env.DB.prepare(
+      `INSERT INTO exchange_idempotency (actor_agent_id, operation, target_ref, idempotency_key, payload_hash, response_status, response_body, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, 0, '', ?6)`
+    ).bind(agent.agent_id, operation, target, key, payloadHash, new Date().toISOString()).run();
+  } catch {
+    return err('idempotency_conflict', 'This Idempotency-Key is already in use by a concurrent request.', 409);
+  }
+  const release = async () => {
+    try {
+      await env.DB.prepare(
+        `DELETE FROM exchange_idempotency WHERE actor_agent_id = ?1 AND operation = ?2 AND target_ref = ?3 AND idempotency_key = ?4`
+      ).bind(agent.agent_id, operation, target, key).run();
+    } catch { /* releasing a reservation is best-effort */ }
+  };
+  let res;
+  try {
+    res = await fn();
+  } catch (e) {
+    await release();
+    throw e;
+  }
+  if (res.status >= 200 && res.status < 300) {
+    try {
+      const text = await res.clone().text();
+      const stored = scrub ? JSON.stringify(scrub(JSON.parse(text))) : text;
+      await env.DB.prepare(
+        `UPDATE exchange_idempotency SET response_status = ?5, response_body = ?6
+         WHERE actor_agent_id = ?1 AND operation = ?2 AND target_ref = ?3 AND idempotency_key = ?4`
+      ).bind(agent.agent_id, operation, target, key, res.status, stored).run();
+      return new Response(text, { status: res.status, headers: res.headers });
+    } catch { /* a lost idempotency record never fails the write */ }
+    return res;
+  }
+  await release();
+  return res;
+}
+
+async function doorsWrite(request, env) {
+  const agent = await authAgent(request, env);
+  if (!agent) return { error: err('unauthorized', 'Valid Bearer api_key required.', 401) };
+  if (!exchangeAdmitted(env, agent)) return { error: err('not_found', 'Not found.', 404) };
+  const ro = writeGuard(agent);
+  if (ro) return { error: ro };
+  if (!(await mgmtLimit(env, agent, 'doors'))) {
+    return { error: rateLimited(`Doors write limit reached (${MGMT_PER_DAY}/day).`, secondsToUtcMidnight()) };
+  }
+  return { agent };
+}
+async function doorsRead(request, env) {
+  const agent = await authAgent(request, env);
+  if (!agent) {
+    if (exchangeEnabled(env) && exchangePublic(env)) return { agent: null };
+    return { error: err('unauthorized', 'Valid Bearer api_key required.', 401) };
+  }
+  if (!exchangeAdmitted(env, agent)) return { error: err('not_found', 'Not found.', 404) };
+  if (!(await checkReadLimit(request, env))) return { error: err('rate_limited', 'Read limit reached. Slow down.', 429) };
+  return { agent };
+}
+
+/** Doors sweep, run lazily on door routes. Two jobs:
+ *  1. Session sweep: a validated entry with no door-reported exit is
+ *     closed at its session cap (exit_source 'sweep', exited_at set
+ *     to the cap moment). Bookkeeping only: this closes the Oids
+ *     record; it does not reach the operator's infrastructure.
+ *  2. Retention: rows 90 days past exited_at (validated entries) or
+ *     past expires_at (never-validated mints) are deleted. See the
+ *     migration 033 header for the rule as defined. */
+async function doorsSweep(env) {
+  const now = new Date().toISOString();
+  const lapsed = await env.DB.prepare(
+    `SELECT id, door_listing_id, public_ref, session_expires_at FROM door_entries
+     WHERE consumed_at IS NOT NULL AND exited_at IS NULL AND session_expires_at IS NOT NULL AND session_expires_at <= ?1`
+  ).bind(now).all();
+  for (const e of lapsed.results || []) {
+    const upd = await env.DB.prepare(
+      `UPDATE door_entries SET exited_at = ?1, exit_source = 'sweep' WHERE id = ?2 AND exited_at IS NULL`
+    ).bind(e.session_expires_at, e.id).run();
+    if (upd.meta.changes === 1) {
+      await exchangeAudit(env, 'listing', e.door_listing_id, null, 'door_entry_swept', 'open', 'swept', { listing_id: e.door_listing_id, entry_ref: e.public_ref });
+    }
+  }
+  const cutoff = new Date(Date.now() - DOOR_ENTRY_RETENTION_DAYS * 86400000).toISOString();
+  await env.DB.prepare(
+    `DELETE FROM door_entries WHERE (exited_at IS NOT NULL AND exited_at < ?1)
+        OR (consumed_at IS NULL AND expires_at < ?1)`
+  ).bind(cutoff).run();
+}
+
+async function doorEntryView(env, e) {
+  return {
+    ref: e.public_ref,
+    door_ref: (await env.DB.prepare('SELECT public_ref FROM exchange_listings WHERE id = ?1').bind(e.door_listing_id).first())?.public_ref || null,
+    agent: await exchangeAgentName(env, e.agent_id),
+    grant_ref: e.grant_id
+      ? ((await env.DB.prepare('SELECT public_ref FROM exchange_grants WHERE id = ?1').bind(e.grant_id).first())?.public_ref || null)
+      : null,
+    issued_at: e.issued_at,
+    expires_at: e.expires_at,
+    consumed_at: e.consumed_at || null,
+    session_expires_at: e.session_expires_at || null,
+    exited_at: e.exited_at || null,
+    exit_source: e.exit_source || null,
+  };
+}
+
+// --- Door registration (listing extension) --------------------------------
+
+async function handleDoorCreate(request, env, ctx) {
+  const pre = await doorsWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return doorIdem(request, env, agent, 'door.create', String(body.listing_ref || ''), body,
+    (stored) => { const c = { ...stored }; delete c.validate_key; c.validate_key_returned = false; c.note = 'The validate key is shown once, at registration. This replay does not return it again.'; return c; },
+    async () => {
+      const fieldErr = exchangeFields(body, new Set(['listing_ref', 'slug', 'entry_url', 'entry_mode', 'session_max_minutes', 'display_tag', 'terms_ack']));
+      if (fieldErr) return fieldErr;
+      if (!body.listing_ref) return err('bad_request', 'listing_ref is required.', 400);
+      const listing = await getListingByRef(env, body.listing_ref);
+      if (!listing) return err('not_found', 'No such listing.', 404);
+      if (listing.owner_agent_id !== agent.agent_id) return err('forbidden', 'Only the listing owner can register a door on this listing.', 403);
+      if (!EXCHANGE_LAUNCH_KINDS.has(listing.kind)) {
+        return err('kind_not_in_phase1', 'This listing kind cannot carry a door in Phase 1.', 400);
+      }
+      const existing = await getDoorByListingId(env, listing.id);
+      if (existing) return err('door_exists', 'This listing already has a door. Edit it with PATCH /api/v1/doors/:ref.', 400);
+      if (body.terms_ack !== true) {
+        return err('door_terms_required', 'Door registration requires terms_ack: true — the operator accepts that a door may not offer wagering, may not charge paid entry, and may not award prizes of value by chance; a bounty-linked door is for skill or work only and settles, if at all, through the existing bounty flow.', 400);
+      }
+      const slug = String(body.slug || '').toLowerCase();
+      if (!/^[a-z0-9][a-z0-9-]{2,47}$/.test(slug)) return err('bad_slug', 'slug must be 3-48 chars of lowercase letters, digits, and hyphens.', 400);
+      const slugTaken = await env.DB.prepare('SELECT listing_id FROM doors WHERE slug = ?1').bind(slug).first();
+      if (slugTaken) return err('slug_taken', 'That slug is already in use by another door.', 400);
+      const nameProblem = await doorNameScreen(env, slug, listing.title, agent.agent_id);
+      if (nameProblem) return err('bad_door_name', nameProblem, 400);
+      const urlCheck = doorCheckEntryUrl(body.entry_url);
+      if (urlCheck.error) return err('bad_entry_url', urlCheck.error, 400);
+      const entryMode = body.entry_mode === undefined ? 'grant' : String(body.entry_mode);
+      if (!['grant', 'open'].includes(entryMode)) return err('bad_entry_mode', 'entry_mode must be grant or open.', 400);
+      if (entryMode === 'open' && (listing.kind === 'own_compute' || listing.kind === 'own_dataset')) {
+        return err('open_not_allowed_for_kind', 'own_compute and own_dataset doors are grant-required always; open entry is rejected for those kinds.', 400);
+      }
+      let sessionMax = body.session_max_minutes === undefined ? 60 : Number(body.session_max_minutes);
+      if (!Number.isInteger(sessionMax) || sessionMax < 1 || sessionMax > DOOR_SESSION_HARD_MAX_MINUTES) {
+        return err('bad_session_max', 'session_max_minutes must be an integer between 1 and 1440 (the 24-hour session record cap).', 400);
+      }
+      let displayTag = null;
+      if (body.display_tag !== undefined && body.display_tag !== null) {
+        displayTag = sanitizeContent(body.display_tag).toLowerCase();
+        if (!DOOR_DISPLAY_TAGS.has(displayTag)) return err('bad_display_tag', 'display_tag must be one of: game, tool, world, data, service.', 400);
+      }
+      const wager = doorWagerScreen([listing.title, listing.description, displayTag]);
+      if (wager) {
+        return err('door_terms_violation', 'Doors may not offer wagering, paid entry, or prizes of value awarded by chance. The listing text names a barred term and the door was not registered.', 400);
+      }
+      if (scanCredentialFields([slug, displayTag || ''])) {
+        return err('credential_blocked', 'That text contains a credential-shaped string and was not stored.', 400);
+      }
+      if (!['free', 'bounty'].includes(listing.price_mode)) {
+        return err('bad_price_mode', 'A door carries only the listing price modes free or bounty.', 400);
+      }
+      if (listing.status === 'live') {
+        const capStatus = await doorCapStatus(env, agent.agent_id);
+        if (capStatus.count >= capStatus.cap) {
+          return err('door_cap_reached', `This operator already has ${capStatus.count} live door(s); the limit for this operator is ${capStatus.cap} live door(s)${capStatus.inFirstWeek ? ' during the operator\'s first 7 days' : ''}.`, 400);
+        }
+      }
+      // Gate condition: creating a door REQUIRES an operator
+      // mapping for the listing owner. Unmapped agents are refused,
+      // so per-agent caps and tenure always have an operator of
+      // record to count against.
+      const opRow = await env.DB.prepare('SELECT operator_id FROM agent_operators WHERE agent_id = ?1').bind(agent.agent_id).first();
+      if (!opRow) {
+        return err('operator_mapping_required', 'Creating a door requires an operator mapping for the listing owner. A mapping records who operates this agent; doors are refused without one.', 400);
+      }
+      const now = new Date().toISOString();
+      const validateKey = 'oids_door_' + b64url(randomBytes(32));
+      const validateHash = await sha256hex(validateKey);
+      await env.DB.prepare(
+        `INSERT INTO doors (listing_id, slug, entry_url, entry_domain, entry_mode, session_max_minutes, display_tag, validate_key_hash, terms_ack_at, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)`
+      ).bind(listing.id, slug, urlCheck.href, urlCheck.domain, entryMode, sessionMax, displayTag, validateHash, now, now).run();
+      await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'door_created', null, entryMode, { listing_id: listing.id, slug, entry_domain: urlCheck.domain });
+      const door = await getDoorByListingId(env, listing.id);
+      return json({
+        door: await doorView(env, door, listing, agent, { fullUrl: true }),
+        validate_key: validateKey,
+        validate_key_returned: true,
+        note: 'The per-door validate key above is shown once. It is usable only for this door\'s validate and exit calls. Store it with the door service, not with agent credentials.',
+        notice: DOOR_NOTICE,
+      }, 201);
+    });
+}
+
+async function handleDoorPatch(request, env, ctx, ref) {
+  const pre = await doorsWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return doorIdem(request, env, agent, 'door.patch', ref, body, null, async () => {
+    const fieldErr = exchangeFields(body, new Set(['slug', 'entry_url', 'entry_mode', 'session_max_minutes', 'display_tag']));
+    if (fieldErr) return fieldErr;
+    const found = await getDoorByRef(env, ref);
+    if (!found) return err('not_found', 'No such door.', 404);
+    const { door, listing } = found;
+    if (listing.owner_agent_id !== agent.agent_id) return err('forbidden', 'Only the listing owner can edit this door.', 403);
+    // Gate round 3: a door under a moderation lock takes no owner
+    // edits at all — round 2 let a domain change overwrite a
+    // taken-down or suspended status with 'paused'.
+    if (Number(listing.moderation_locked) === 1) {
+      return err('moderation_locked', 'This door is under a moderation lock. It cannot be edited until the moderation review clears it.', 403);
+    }
+    const next = { ...door };
+    const now = new Date().toISOString();
+    let domainChanged = false;
+    if (body.slug !== undefined) {
+      const slug = String(body.slug).toLowerCase();
+      if (!/^[a-z0-9][a-z0-9-]{2,47}$/.test(slug)) return err('bad_slug', 'slug must be 3-48 chars of lowercase letters, digits, and hyphens.', 400);
+      const taken = await env.DB.prepare('SELECT listing_id FROM doors WHERE slug = ?1 AND listing_id != ?2').bind(slug, listing.id).first();
+      if (taken) return err('slug_taken', 'That slug is already in use by another door.', 400);
+      const nameProblem = await doorNameScreen(env, slug, listing.title, agent.agent_id);
+      if (nameProblem) return err('bad_door_name', nameProblem, 400);
+      next.slug = slug;
+    }
+    if (body.entry_url !== undefined) {
+      const urlCheck = doorCheckEntryUrl(body.entry_url);
+      if (urlCheck.error) return err('bad_entry_url', urlCheck.error, 400);
+      next.entry_url = urlCheck.href;
+      if (urlCheck.domain !== door.entry_domain) { domainChanged = true; next.entry_domain = urlCheck.domain; }
+    }
+    if (body.entry_mode !== undefined) {
+      const v = String(body.entry_mode);
+      if (!['grant', 'open'].includes(v)) return err('bad_entry_mode', 'entry_mode must be grant or open.', 400);
+      if (v === 'open' && (listing.kind === 'own_compute' || listing.kind === 'own_dataset')) {
+        return err('open_not_allowed_for_kind', 'own_compute and own_dataset doors are grant-required always; open entry is rejected for those kinds.', 400);
+      }
+      next.entry_mode = v;
+    }
+    if (body.session_max_minutes !== undefined) {
+      const v = Number(body.session_max_minutes);
+      if (!Number.isInteger(v) || v < 1 || v > DOOR_SESSION_HARD_MAX_MINUTES) {
+        return err('bad_session_max', 'session_max_minutes must be an integer between 1 and 1440 (the 24-hour session record cap).', 400);
+      }
+      next.session_max_minutes = v;
+    }
+    if (body.display_tag !== undefined) {
+      if (body.display_tag === null) next.display_tag = null;
+      else {
+        const v = sanitizeContent(body.display_tag).toLowerCase();
+        if (!DOOR_DISPLAY_TAGS.has(v)) return err('bad_display_tag', 'display_tag must be one of: game, tool, world, data, service.', 400);
+        next.display_tag = v;
+      }
+    }
+    // D4: the door write and (on a domain change) the listing pause
+    // land in ONE env.DB.batch, never as two separate writes.
+    const doorUpdate = env.DB.prepare(
+      `UPDATE doors SET slug = ?1, entry_url = ?2, entry_domain = ?3, entry_mode = ?4, session_max_minutes = ?5, display_tag = ?6, updated_at = ?7
+       WHERE listing_id = ?8`
+    ).bind(next.slug, next.entry_url, next.entry_domain, next.entry_mode, next.session_max_minutes, next.display_tag, now, listing.id);
+    let pausedForReattest = false;
+    const batchStmts = [doorUpdate];
+    if (domainChanged) {
+      // Condition 2: a change of registrable domain pauses the listing
+      // until the human operator re-attests. The revision moves so the
+      // earlier attestation no longer covers the listing, and the
+      // listing leaves the live state in the same change.
+      const newRevision = Number(listing.revision) + 1;
+      batchStmts.push(env.DB.prepare(
+        `UPDATE exchange_listings SET status = 'paused', attestation = 'stale', revision = ?1, updated_at = ?2 WHERE id = ?3 AND status NOT IN ('taken_down', 'suspended')`
+      ).bind(newRevision, now, listing.id));
+      pausedForReattest = true;
+    }
+    await env.DB.batch(batchStmts);
+    if (domainChanged) {
+      await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'door_domain_changed', listing.status, 'paused',
+        { listing_id: listing.id, slug: next.slug, entry_domain: next.entry_domain });
+    } else {
+      const changedUrl = body.entry_url !== undefined && next.entry_url !== door.entry_url;
+      const changedMode = body.entry_mode !== undefined && next.entry_mode !== door.entry_mode;
+      if (changedUrl || changedMode) {
+        await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'door_edited', listing.status, listing.status,
+          { listing_id: listing.id, slug: next.slug, entry_url_changed: changedUrl, entry_mode_changed: changedMode });
+      }
+    }
+    const row = await getDoorByListingId(env, listing.id);
+    const listingRow = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(listing.id).first();
+    const view = await doorView(env, row, listingRow, agent, { fullUrl: true });
+    if (pausedForReattest) {
+      view.paused_for_reattestation = true;
+      view.note = 'The entry domain changed, so this listing is paused. It returns to the menu only after the human operator re-attests and the listing goes live again.';
+    }
+    return json({ door: view });
+  });
+}
+
+async function handleDoorRotateValidateKey(request, env, ctx, ref) {
+  const pre = await doorsWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return doorIdem(request, env, agent, 'door.rotate_validate_key', ref, body,
+    (stored) => { const c = { ...stored }; delete c.validate_key; c.validate_key_returned = false; return c; },
+    async () => {
+      const fieldErr = exchangeFields(body, new Set([]));
+      if (fieldErr) return fieldErr;
+      const found = await getDoorByRef(env, ref);
+      if (!found) return err('not_found', 'No such door.', 404);
+      if (found.listing.owner_agent_id !== agent.agent_id) return err('forbidden', 'Only the listing owner can rotate this door\'s validate key.', 403);
+      const validateKey = 'oids_door_' + b64url(randomBytes(32));
+      const now = new Date().toISOString();
+      const upd = await env.DB.prepare(
+        `UPDATE doors SET validate_key_hash = ?1, updated_at = ?2 WHERE listing_id = ?3`
+      ).bind(await sha256hex(validateKey), now, found.listing.id).run();
+      if (upd.meta.changes !== 1) return err('not_found', 'No such door.', 404);
+      await exchangeAudit(env, 'listing', found.listing.id, agent.agent_id, 'door_validate_key_rotated', null, null, { listing_id: found.listing.id, slug: found.door.slug });
+      return json({ door_ref: found.listing.public_ref, slug: found.door.slug, validate_key: validateKey, validate_key_returned: true, note: 'The new per-door validate key is shown once. The earlier key stops working at once.' });
+    });
+}
+
+// --- Menu and read ---------------------------------------------------------
+
+async function handleDoorsList(request, env) {
+  const { agent, error } = await doorsRead(request, env);
+  if (error) return error;
+  const rows = await env.DB.prepare('SELECT * FROM doors ORDER BY slug').all();
+  const out = [];
+  for (const door of rows.results || []) {
+    const listing = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(door.listing_id).first();
+    if (!listing || !listingEligible(listing)) continue;
+    if (!(await listingAudienceAdmits(env, listing, agent ? agent.agent_id : null))) continue;
+    out.push(await doorView(env, door, listing, agent));
+  }
+  out.sort((a, b) => (b.entry_count_30d - a.entry_count_30d) || a.slug.localeCompare(b.slug));
+  return json({ doors: out, notice: DOOR_NOTICE });
+}
+
+async function handleDoorGet(request, env, ref) {
+  const { agent, error } = await doorsRead(request, env);
+  if (error) return error;
+  const found = await getDoorByRef(env, ref);
+  if (!found) return err('not_found', 'No such door.', 404);
+  const { door, listing } = found;
+  const isOwner = agent && agent.agent_id === listing.owner_agent_id;
+  if (!isOwner) {
+    if (!listingEligible(listing)) return err('not_found', 'No such door.', 404);
+    if (!(await listingAudienceAdmits(env, listing, agent ? agent.agent_id : null))) return err('not_found', 'No such door.', 404);
+  }
+  return json({ door: await doorView(env, door, listing, agent, { fullUrl: true }) });
+}
+
+// --- Entry pass-through ------------------------------------------------------
+
+async function handleDoorEnter(request, env, ctx, ref) {
+  const pre = await doorsWrite(request, env);
+  if (pre.error) return pre.error;
+  const agent = pre.agent;
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const body = parsed.body;
+  return doorIdem(request, env, agent, 'door.enter', ref, body,
+    (stored) => {
+      const c = JSON.parse(JSON.stringify(stored));
+      if (c.entry) { delete c.entry.token; c.entry.token_returned = false; }
+      c.note = 'The entry token is shown once, at mint. This replay does not return it again, and no second entry was created.';
+      return c;
+    },
+    async () => {
+      const fieldErr = exchangeFields(body, new Set(['show_in_callers']));
+      if (fieldErr) return fieldErr;
+      const found = await getDoorByRef(env, ref);
+      if (!found) return err('not_found', 'No such door.', 404);
+      const { door, listing } = found;
+      if (!listingEligible(listing)) return err('not_found', 'No such door.', 404);
+      if (!(await listingAudienceAdmits(env, listing, agent.agent_id))) return err('not_found', 'No such door.', 404);
+      if (await handoffBlocked(env, agent.agent_id, listing.owner_agent_id)) {
+        await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'door_entry_blocked', null, null, { listing_id: listing.id, slug: door.slug });
+        return err('blocked', 'A block is in effect between you and the door operator; entry is refused.', 403);
+      }
+      let grant = null;
+      if (door.entry_mode === 'grant') {
+        const grants = await env.DB.prepare(
+          `SELECT * FROM exchange_grants WHERE listing_id = ?1 AND status = 'active' AND expires_at > ?2 ORDER BY id DESC`
+        ).bind(listing.id, new Date().toISOString()).all();
+        for (const g of grants.results || []) {
+          if (!parseIdList(g.grantee_ids).includes(agent.agent_id)) continue;
+          if (await grantExitDenied(env, g, agent.agent_id)) continue;
+          grant = g;
+          break;
+        }
+        if (!grant) return err('no_grant', 'This door is grant-required and no active grant on its listing names you. Entry is refused and no entry record was created.', 403);
+      } else {
+        // Open mode (condition 7): own-built service kinds only, and
+        // the menu carries the no-human-approval notice for this door.
+        if (listing.kind === 'own_compute' || listing.kind === 'own_dataset') {
+          return err('open_not_allowed_for_kind', 'own_compute and own_dataset doors are grant-required always.', 403);
+        }
+        if (!['own_service', 'human_service'].includes(listing.kind)) {
+          return err('open_not_allowed_for_kind', 'Open entry is limited to own_service and human_service doors.', 403);
+        }
+      }
+      const now = new Date();
+      const expires = new Date(now.getTime() + DOOR_TOKEN_TTL_MS);
+      const token = b64url(randomBytes(32)); // 256-bit entry token
+      const tokenHash = await sha256hex(token);
+      const sessionRef = exchangeRef();
+      const ins = await env.DB.prepare(
+        `INSERT INTO door_entries (public_ref, door_listing_id, agent_id, grant_id, token_hash, issued_at, expires_at, opt_in_visible, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?6)`
+      ).bind(sessionRef, listing.id, agent.agent_id, grant ? grant.id : null, tokenHash, now.toISOString(), expires.toISOString(), body.show_in_callers === true ? 1 : 0).run();
+      await exchangeAudit(env, 'listing', listing.id, agent.agent_id, 'door_entry_minted', null, 'issued', { listing_id: listing.id, entry_id: ins.meta.last_row_id, grant_id: grant ? grant.id : null });
+      return json({
+        entry: {
+          ref: sessionRef,
+          door_ref: listing.public_ref,
+          slug: door.slug,
+          token,
+          token_returned: true,
+          expires_at: expires.toISOString(),
+          entry_url: door.entry_url,
+          presentation: 'header',
+          presentation_header: 'Authorization: Bearer <token>',
+          notice: DOOR_NOTICE,
+        },
+      }, 201);
+    });
+}
+
+/** Validate is answered with the per-door validate key only. Every
+ *  failure answers the same {valid:false} — a caller learns nothing
+ *  about which binding, state, or timing check failed. */
+const DOOR_VALIDATE_PER_MINUTE = 300;
+const DOOR_EXIT_PER_MINUTE = 120;
+
+async function handleDoorValidate(request, env) {
+  const invalid = () => json({ valid: false }, 200);
+  const auth = request.headers.get('Authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  if (!m) return invalid();
+  const presentedHash = await sha256hex(m[1]);
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return invalid();
+  const body = parsed.body;
+  for (const k of Object.keys(body)) {
+    if (!['token', 'door_ref', 'door_slug'].includes(k)) return invalid();
+  }
+  if (!body.token || !(body.door_ref || body.door_slug)) return invalid();
+  // Gate condition: validate is unauthenticated-reachable, so it is
+  // rate-limited per door + caller. A limited call answers the same
+  // {valid:false} as every other failure.
+  const vKey = `rl:door-validate:${String(body.door_ref || body.door_slug)}:${clientIp(request)}:${minuteStamp()}`;
+  if (!(await checkLimit(env, vKey, DOOR_VALIDATE_PER_MINUTE, 120))) return invalid();
+  const found = await getDoorByRef(env, body.door_ref || body.door_slug);
+  if (!found) return invalid();
+  const { door, listing } = found;
+  if (!safeEqual(presentedHash, String(door.validate_key_hash || ''))) return invalid();
+  const tokenHash = await sha256hex(String(body.token));
+  const entry = await env.DB.prepare(
+    'SELECT * FROM door_entries WHERE token_hash = ?1 AND door_listing_id = ?2'
+  ).bind(tokenHash, listing.id).first();
+  if (!entry) return invalid();
+  if (entry.consumed_at) return invalid();
+  const now = new Date();
+  if (Date.parse(entry.expires_at) <= now.getTime()) return invalid();
+  if (!listingEligible(listing)) return invalid();
+  if (await handoffBlocked(env, entry.agent_id, listing.owner_agent_id)) return invalid();
+  let grant = null;
+  if (entry.grant_id) {
+    grant = await env.DB.prepare('SELECT * FROM exchange_grants WHERE id = ?1').bind(entry.grant_id).first();
+    if (!grant || grant.status !== 'active' || Date.parse(grant.expires_at) <= now.getTime()) return invalid();
+    if (await grantExitDenied(env, grant, entry.agent_id)) return invalid();
+  } else if (door.entry_mode !== 'open') {
+    return invalid();
+  }
+  const sessionExpires = new Date(now.getTime() + Number(door.session_max_minutes) * 60000);
+  const upd = await env.DB.prepare(
+    `UPDATE door_entries SET consumed_at = ?1, session_expires_at = ?2
+     WHERE id = ?3 AND consumed_at IS NULL AND expires_at > ?1`
+  ).bind(now.toISOString(), sessionExpires.toISOString(), entry.id).run();
+  if (upd.meta.changes !== 1) return invalid();
+  await exchangeAudit(env, 'listing', listing.id, entry.agent_id, 'door_entry_validated', 'issued', 'validated', { listing_id: listing.id, entry_id: entry.id, grant_id: entry.grant_id || null });
+  return json({
+    valid: true,
+    agent: await exchangeAgentName(env, entry.agent_id),
+    session_id: entry.public_ref,
+    grant_ref: grant ? grant.public_ref : null,
+    expires_at: sessionExpires.toISOString(),
+    session_expires_at: sessionExpires.toISOString(),
+  });
+}
+
+async function handleDoorExit(request, env, ref) {
+  // Gate condition: exit is unauthenticated-reachable (validate key),
+  // so it is rate-limited per session ref + caller.
+  if (!(await checkLimit(env, `rl:door-exit:${String(ref || '')}:${clientIp(request)}:${minuteStamp()}`, DOOR_EXIT_PER_MINUTE, 120))) {
+    return err('rate_limited', 'Too many exit calls. Slow down.', 429);
+  }
+  const auth = request.headers.get('Authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  if (!m) return err('not_found', 'No such session.', 404);
+  const presentedHash = await sha256hex(m[1]);
+  const entry = await env.DB.prepare('SELECT * FROM door_entries WHERE public_ref = ?1').bind(String(ref || '')).first();
+  if (!entry) return err('not_found', 'No such session.', 404);
+  const door = await getDoorByListingId(env, entry.door_listing_id);
+  if (!door || !safeEqual(presentedHash, String(door.validate_key_hash || ''))) return err('not_found', 'No such session.', 404);
+  const parsed = await exchangeJsonBody(request);
+  if (parsed.error) return parsed.error;
+  const fieldErr = exchangeFields(parsed.body, new Set([]));
+  if (fieldErr) return fieldErr;
+  if (!entry.consumed_at) return err('bad_request', 'This entry was never validated, so there is no session to exit.', 400);
+  if (entry.exited_at) {
+    const row = await env.DB.prepare('SELECT * FROM door_entries WHERE id = ?1').bind(entry.id).first();
+    return json({ entry: await doorEntryView(env, row) });
+  }
+  const now = new Date().toISOString();
+  const upd = await env.DB.prepare(
+    `UPDATE door_entries SET exited_at = ?1, exit_source = 'door' WHERE id = ?2 AND exited_at IS NULL AND consumed_at IS NOT NULL`
+  ).bind(now, entry.id).run();
+  if (upd.meta.changes !== 1) {
+    const row = await env.DB.prepare('SELECT * FROM door_entries WHERE id = ?1').bind(entry.id).first();
+    return json({ entry: await doorEntryView(env, row) });
+  }
+  await exchangeAudit(env, 'listing', entry.door_listing_id, entry.agent_id, 'door_entry_exit', 'validated', 'exited', { listing_id: entry.door_listing_id, entry_id: entry.id });
+  const row = await env.DB.prepare('SELECT * FROM door_entries WHERE id = ?1').bind(entry.id).first();
+  return json({ entry: await doorEntryView(env, row) });
+}
+
+// --- Web page -----------------------------------------------------------------
+
+function doorHtmlEscape(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+async function handleDoorsPage(request, env) {
+  const rows = await env.DB.prepare('SELECT * FROM doors ORDER BY slug').all();
+  const items = [];
+  let n = 0;
+  for (const door of rows.results || []) {
+    const listing = await env.DB.prepare('SELECT * FROM exchange_listings WHERE id = ?1').bind(door.listing_id).first();
+    if (!listing || !listingEligible(listing) || listing.audience !== 'public') continue;
+    n += 1;
+    const counts = await doorCounts(env, listing.id);
+    const ownerName = await exchangeAgentName(env, listing.owner_agent_id);
+    let host = '';
+    try { host = new URL(door.entry_url).host; } catch { host = ''; }
+    items.push(`<li>${n}. ${doorHtmlEscape(listing.title)} — ${doorHtmlEscape(doorPitch(listing))} (operator: @${doorHtmlEscape(ownerName || '')}, ${doorHtmlEscape(host)}, ${doorHtmlEscape(door.entry_mode)}, entries in the trailing 30 days: ${counts.entry_count_30d}, distinct operators: ${counts.distinct_operators_30d})${door.entry_mode === 'open' ? ' — open door: no human approval occurred for entry' : ''}</li>`);
+  }
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Oids Doors</title></head><body><h1>Doors</h1><p>${doorHtmlEscape(DOOR_NOTICE)}</p><p>${doorHtmlEscape(DOOR_SESSION_HONESTY)}</p><ul>${items.join('')}</ul></body></html>`;
+  return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', ...securityHeaders() } });
+}
+
+// --- Dispatcher -----------------------------------------------------------------
+
+async function handleDoorsRoute(request, env, ctx, path, method) {
+  if (!doorsEnabled(env)) return err('not_found', 'Not found.', 404);
+  const seg = path.split('/').filter(Boolean); // api, v1, doors, ...
+  const sub = seg.slice(3);
+  const isValidate = method === 'POST' && sub.length === 1 && sub[0] === 'validate';
+  const isExit = method === 'POST' && sub.length === 3 && sub[0] === 'sessions' && sub[2] === 'exit';
+  // Gate condition: the sweeps do NOT run on the validate/exit path;
+  // they run on the other door routes, and the Exchange sweep with
+  // them. Validate and exit stay cheap and rate-limited instead.
+  if (isValidate) return handleDoorValidate(request, env);
+  if (isExit) return handleDoorExit(request, env, sub[1]);
+  // Gate round 3: the sweeps run only for a KNOWN route and only
+  // after the caller authenticates as a pilot-admitted agent.
+  // Round 2 ran both sweeps pre-auth on every Doors path, known or
+  // not, so an unauthenticated probe could drive sweep work. The
+  // handlers still run their own full prelude (rate budgets are not
+  // consumed twice; this check is reads only).
+  const knownRoute = (sub.length === 0 && (method === 'GET' || method === 'POST'))
+    || (sub.length === 1 && (method === 'GET' || method === 'PATCH'))
+    || (sub.length === 2 && sub[1] === 'enter' && method === 'POST')
+    || (sub.length === 2 && sub[1] === 'rotate-validate-key' && method === 'POST');
+  if (!knownRoute) return err('not_found', 'Unknown Doors endpoint.', 404);
+  const sweepAgent = await authAgent(request, env);
+  if (sweepAgent && exchangeAdmitted(env, sweepAgent)) {
+    await doorsSweep(env);
+    await exchangeSweep(env, ctx);
+  }
+  if (sub.length === 0) {
+    if (method === 'GET') return handleDoorsList(request, env);
+    if (method === 'POST') return handleDoorCreate(request, env, ctx);
+  }
+  if (sub.length === 1) {
+    if (method === 'GET') return handleDoorGet(request, env, sub[0]);
+    if (method === 'PATCH') return handleDoorPatch(request, env, ctx, sub[0]);
+  }
+  if (sub.length === 2 && sub[1] === 'enter' && method === 'POST') return handleDoorEnter(request, env, ctx, sub[0]);
+  if (sub.length === 2 && sub[1] === 'rotate-validate-key' && method === 'POST') return handleDoorRotateValidateKey(request, env, ctx, sub[0]);
+  return err('not_found', 'Unknown Doors endpoint.', 404);
+}
+// ===== DOORS END =====
+
+
 // ---------------------------------------------------------------------------
 // Admin room share links (Desk Chat). Room links are no-login credentials
 // (see the room-link consumers above); until now every mint was a hand-run
@@ -8493,6 +9461,15 @@ export default {
     // Retro hit counter.
     if (method === 'GET' && path === '/api/hits') return R(handleHitsGet(request, env));
 
+    // Oids Doors (MVP, migration 033). Every door route 404s while
+    // DOORS_ENABLED is off, and also while EXCHANGE_ENABLED is off.
+    if (path.startsWith('/api/v1/doors')) {
+      return R(handleDoorsRoute(request, env, ctx, path, method));
+    }
+    if (method === 'GET' && path === '/doors') {
+      if (!doorsEnabled(env)) return R(err('not_found', 'Unknown endpoint. See /llms.txt.', 404));
+      return R(handleDoorsPage(request, env));
+    }
     // Capability Exchange (Phase 1, migration 032). Every route 404s
     // while EXCHANGE_ENABLED is off, and the pilot gate inside admits
     // only the pilot configuration while EXCHANGE_PUBLIC is off.
