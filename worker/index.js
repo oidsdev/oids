@@ -8155,20 +8155,30 @@ function doorIsIpLiteral(host) {
  *  domain} or {error}. */
 function doorCheckEntryUrl(raw) {
   const rawStr = String(raw || '');
-  // D1: reject percent-encoded dots before parsing, so an encoded
-  // host can never slip a dotted variant past the checks below.
+  // D1 (gate round 3): a backslash is a separator to the URL parser
+  // but not to a naive authority split, which is how backslash forms
+  // slipped the round-2 pre-check. An entry URL never legitimately
+  // contains one: refuse outright.
+  if (rawStr.includes('\\')) return { error: 'entry_url must not contain backslashes.' };
+  // D1: reject percent-encoded characters in the authority segment
+  // before parsing, so an encoded host can never slip a dotted or
+  // obfuscated variant past the checks below.
   const hostPart = rawStr.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[/?#]/)[0];
-  if (/%2e/i.test(hostPart)) return { error: 'entry_url host must not carry encoded characters.' };
+  if (hostPart.includes('%')) return { error: 'entry_url host must not carry encoded characters.' };
   let u;
   try { u = new URL(rawStr); } catch { return { error: 'entry_url must be a valid https URL.' }; }
   if (u.protocol !== 'https:') return { error: 'entry_url must be https.' };
   if (u.username || u.password) return { error: 'entry_url must not carry credentials.' };
-  // D1: normalize the host (strip ONE trailing dot) before every
-  // host check, so dotted variants of blocked hosts still fail.
-  let host = u.hostname.toLowerCase();
-  if (host.endsWith('.')) host = host.slice(0, -1);
-  if (host !== u.hostname.toLowerCase()) { try { u.hostname = host; } catch { /* keep the parsed href */ } }
+  // D1 (gate round 3): every check runs on the FINAL parsed
+  // hostname, and a host that ends in a dot or carries an empty
+  // label is REJECTED, never normalized — tryoids.com.. ,
+  // localhost.. and 127.0.0.1.. fail here instead of being stripped
+  // to the bare blocked host (round 2 stripped exactly one dot).
+  const host = u.hostname.toLowerCase();
   if (!host || !host.includes('.')) return { error: 'entry_url must name a public host.' };
+  if (host.split('.').some((label) => label === '')) {
+    return { error: 'entry_url host must not end in a dot or contain an empty label.' };
+  }
   if (doorIsIpLiteral(host)) return { error: 'entry_url must not be an IP literal; use a public https host name.' };
   if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan') || host.endsWith('.home')) {
     return { error: 'entry_url must not name a private or local host.' };
@@ -8375,7 +8385,7 @@ async function doorIdem(request, env, agent, operation, targetRef, body, scrub, 
   const target = targetRef || '';
   const payloadHash = await sha256hex(stableStringify(body || {}));
   const prior = await env.DB.prepare(
-    `SELECT operation, target_ref, response_status, response_body, payload_hash FROM exchange_idempotency
+    `SELECT operation, target_ref, response_status, response_body, payload_hash, created_at FROM exchange_idempotency
      WHERE actor_agent_id = ?1 AND idempotency_key = ?2`
   ).bind(agent.agent_id, key).all();
   const priorRows = prior.results || [];
@@ -8390,7 +8400,19 @@ async function doorIdem(request, env, agent, operation, targetRef, body, scrub, 
     return json(JSON.parse(existing.response_body), existing.response_status);
   }
   if (existing) {
-    return err('idempotency_conflict', 'This Idempotency-Key is already in use by a concurrent request.', 409);
+    // Same rule as the Exchange stack (gate round 3): a status-0
+    // reservation past its short TTL counts as free — its isolate
+    // died before recording — and is dropped so the retry below
+    // can claim the key fresh. A live reservation still wins.
+    const ageMs = Date.now() - Date.parse(existing.created_at || '');
+    if (!(Number.isFinite(ageMs) && ageMs > EXCHANGE_IDEM_PLACEHOLDER_TTL_MS)) {
+      return err('idempotency_conflict', 'This Idempotency-Key is already in use by a concurrent request.', 409);
+    }
+    try {
+      await env.DB.prepare(
+        `DELETE FROM exchange_idempotency WHERE actor_agent_id = ?1 AND operation = ?2 AND target_ref = ?3 AND idempotency_key = ?4 AND response_status = 0`
+      ).bind(agent.agent_id, operation, target, key).run();
+    } catch { /* if the drop loses a race, the claim below answers 409 */ }
   }
   try {
     await env.DB.prepare(
@@ -8603,6 +8625,12 @@ async function handleDoorPatch(request, env, ctx, ref) {
     if (!found) return err('not_found', 'No such door.', 404);
     const { door, listing } = found;
     if (listing.owner_agent_id !== agent.agent_id) return err('forbidden', 'Only the listing owner can edit this door.', 403);
+    // Gate round 3: a door under a moderation lock takes no owner
+    // edits at all — round 2 let a domain change overwrite a
+    // taken-down or suspended status with 'paused'.
+    if (Number(listing.moderation_locked) === 1) {
+      return err('moderation_locked', 'This door is under a moderation lock. It cannot be edited until the moderation review clears it.', 403);
+    }
     const next = { ...door };
     const now = new Date().toISOString();
     let domainChanged = false;
@@ -8659,7 +8687,7 @@ async function handleDoorPatch(request, env, ctx, ref) {
       // listing leaves the live state in the same change.
       const newRevision = Number(listing.revision) + 1;
       batchStmts.push(env.DB.prepare(
-        `UPDATE exchange_listings SET status = 'paused', attestation = 'stale', revision = ?1, updated_at = ?2 WHERE id = ?3`
+        `UPDATE exchange_listings SET status = 'paused', attestation = 'stale', revision = ?1, updated_at = ?2 WHERE id = ?3 AND status NOT IN ('taken_down', 'suspended')`
       ).bind(newRevision, now, listing.id));
       pausedForReattest = true;
     }
@@ -8953,12 +8981,24 @@ async function handleDoorsRoute(request, env, ctx, path, method) {
   // Gate condition: the sweeps do NOT run on the validate/exit path;
   // they run on the other door routes, and the Exchange sweep with
   // them. Validate and exit stay cheap and rate-limited instead.
-  if (!isValidate && !isExit) {
+  if (isValidate) return handleDoorValidate(request, env);
+  if (isExit) return handleDoorExit(request, env, sub[1]);
+  // Gate round 3: the sweeps run only for a KNOWN route and only
+  // after the caller authenticates as a pilot-admitted agent.
+  // Round 2 ran both sweeps pre-auth on every Doors path, known or
+  // not, so an unauthenticated probe could drive sweep work. The
+  // handlers still run their own full prelude (rate budgets are not
+  // consumed twice; this check is reads only).
+  const knownRoute = (sub.length === 0 && (method === 'GET' || method === 'POST'))
+    || (sub.length === 1 && (method === 'GET' || method === 'PATCH'))
+    || (sub.length === 2 && sub[1] === 'enter' && method === 'POST')
+    || (sub.length === 2 && sub[1] === 'rotate-validate-key' && method === 'POST');
+  if (!knownRoute) return err('not_found', 'Unknown Doors endpoint.', 404);
+  const sweepAgent = await authAgent(request, env);
+  if (sweepAgent && exchangeAdmitted(env, sweepAgent)) {
     await doorsSweep(env);
     await exchangeSweep(env, ctx);
   }
-  if (isValidate) return handleDoorValidate(request, env);
-  if (isExit) return handleDoorExit(request, env, sub[1]);
   if (sub.length === 0) {
     if (method === 'GET') return handleDoorsList(request, env);
     if (method === 'POST') return handleDoorCreate(request, env, ctx);

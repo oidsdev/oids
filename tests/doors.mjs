@@ -887,8 +887,12 @@ async function gateRound2Doors() {
       assert(r.status === 400 && r.json.error === 'bad_entry_url', label + ' is rejected, got ' + r.status + ' ' + r.text);
     }
     assert(sqlOne(w, 'SELECT COUNT(*) AS n FROM doors').n === 0, 'no door from a dotted or encoded host');
-    const okDoor = await makeDoor(w, 'owner_bot', listing.ref, { slug: 'dot-door', entry_url: 'https://doors.example.com./entry' });
-    assert(okDoor.door.entry_domain === 'example.com', 'one trailing dot on a public host is normalized away, domain is ' + okDoor.door.entry_domain);
+    // Gate round 3 supersedes the round-2 normalization: a trailing
+    // dot on ANY host, public included, is rejected, never stripped.
+    const dotted = await w.call('POST', '/api/v1/doors', { key: KEY.owner_bot, body: { listing_ref: listing.ref, slug: 'dot-door', entry_url: 'https://doors.example.com./entry', terms_ack: true } });
+    assert(dotted.status === 400 && dotted.json.error === 'bad_entry_url', 'one trailing dot on a public host is rejected under round 3, got ' + dotted.status + ' ' + dotted.text);
+    const okDoor = await makeDoor(w, 'owner_bot', listing.ref, { slug: 'dot-door', entry_url: 'https://doors.example.com/entry' });
+    assert(okDoor.door.entry_domain === 'example.com', 'the clean public host still registers, domain is ' + okDoor.door.entry_domain);
   });
 
   await section('D2 Exchange PATCH on a door listing re-runs all three screens', async () => {
@@ -1037,10 +1041,111 @@ async function gateRound2Doors() {
 }
 
 
+// ===========================================================================
+// Gate round 3 (2026-10-23): D1 bypass forms, moderation lock,
+// post-auth sweeps, door idempotency placeholder TTL
+// ===========================================================================
+async function gateRound3Doors() {
+  await section('R3 D1 bypass forms: multi-dot, IP literals, backslash and encoded hosts all fail', async () => {
+    const w = await makeWorld();
+    establishOperator(w, 1, 'op_owner');
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Bypass forms service' });
+    const bad = [
+      ['https://tryoids.com../e', 'a double-dotted Oids host'],
+      ['https://localhost../e', 'a double-dotted localhost'],
+      ['https://svc.internal../e', 'a double-dotted internal host'],
+      ['https://127.0.0.1../e', 'an IPv4 with trailing dots (round 2 re-parsed it to the bare address)'],
+      ['https://127.0.0.1/e', 'a bare IPv4 literal'],
+      ['https://127.1/e', 'a short-form IPv4'],
+      ['https://0x7f.1/e', 'a hex-form IPv4'],
+      ['https://[::1]/e', 'an IPv6 literal'],
+      ['https://tryoids.com\\@evil.example/e', 'a backslash form hiding the real host'],
+      ['https://evil.example\\tryoids.com/e', 'a backslash form faking the host'],
+      ['https://exampl%65.com/e', 'an encoded letter in the host'],
+      ['http://doors.example.com/e', 'a non-https URL'],
+    ];
+    for (const [url, label] of bad) {
+      const r = await w.call('POST', '/api/v1/doors', { key: KEY.owner_bot, body: { listing_ref: listing.ref, slug: 'r3-door', entry_url: url, terms_ack: true } });
+      assert(r.status === 400 && r.json.error === 'bad_entry_url', label + ' is rejected, got ' + r.status + ' ' + r.text);
+    }
+    assert(sqlOne(w, 'SELECT COUNT(*) AS n FROM doors').n === 0, 'no door from any bypass form');
+    const ok = await makeDoor(w, 'owner_bot', listing.ref, { slug: 'r3-door' });
+    assert(ok.door.entry_domain === 'example.com', 'the clean public https host still registers');
+  });
+
+  await section('R3 moderation lock: door edits refused while locked, status never moved', async () => {
+    const w = await makeWorld();
+    establishOperator(w, 1, 'op_owner');
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Lockable door service' });
+    await makeDoor(w, 'owner_bot', listing.ref, { slug: 'lock-door' });
+    const susp = await w.call('POST', `/api/v1/exchange/listings/${listing.ref}/suspend`, { key: KEY.mod_bot, body: { reason: 'abuse review' } });
+    assert(susp.status === 200, 'the moderator suspend lands, got ' + susp.status + ' ' + susp.text);
+    const plain = await w.call('PATCH', `/api/v1/doors/${listing.ref}`, { key: KEY.owner_bot, body: { entry_url: 'https://doors.example.com/other' } });
+    assert(plain.status === 403 && plain.json.error === 'moderation_locked', 'a same-domain door edit is refused under the lock, got ' + plain.status + ' ' + plain.text);
+    const domainChange = await w.call('PATCH', `/api/v1/doors/${listing.ref}`, { key: KEY.owner_bot, body: { entry_url: 'https://elsewhere.example.net/e' } });
+    assert(domainChange.status === 403 && domainChange.json.error === 'moderation_locked', 'a domain change is refused under the lock, got ' + domainChange.status + ' ' + domainChange.text);
+    const row = sqlOne(w, 'SELECT status, attestation FROM exchange_listings WHERE public_ref = ?', listing.ref);
+    assert(row.status === 'suspended', 'the listing status was never moved out of suspended, got ' + row.status);
+    const doorRow = sqlOne(w, 'SELECT entry_url FROM doors WHERE slug = ?', 'lock-door');
+    assert(doorRow.entry_url === 'https://doors.example.com/entry', 'the door row is untouched');
+    const unlock = await w.call('POST', `/api/v1/exchange/listings/${listing.ref}/unlock`, { key: KEY.mod_bot, body: {} });
+    assert(unlock.status === 200, 'the moderator unlock lands, got ' + unlock.status + ' ' + unlock.text);
+    const after = await w.call('PATCH', `/api/v1/doors/${listing.ref}`, { key: KEY.owner_bot, body: { entry_url: 'https://doors.example.com/other' } });
+    assert(after.status === 200, 'door edits work again once the lock clears, got ' + after.status + ' ' + after.text);
+  });
+
+  await section('R3 sweeps run after auth, on known routes only', async () => {
+    const w = await makeWorld();
+    establishOperator(w, 1, 'op_owner');
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'Sweep order service' });
+    await makeDoor(w, 'owner_bot', listing.ref, { slug: 'sweep-door' });
+    const listingId = sqlOne(w, 'SELECT id FROM exchange_listings WHERE public_ref = ?', listing.ref).id;
+    const old = new Date(Date.now() - 100 * 86400000).toISOString();
+    w.db.prepare(`INSERT INTO door_entries (public_ref, door_listing_id, agent_id, grant_id, token_hash, consumed_at, issued_at, expires_at, session_expires_at, exited_at, exit_source, created_at)
+                  VALUES ('exr_r3stale', ?, 1, NULL, 'hash-r3-stale', NULL, ?, ?, NULL, NULL, NULL, ?)`)
+      .run(listingId, old, old, old);
+    const anon = await w.call('GET', '/api/v1/doors', {});
+    assert(anon.status === 200 || anon.status === 401, 'the anonymous list call answers, got ' + anon.status);
+    assert(sqlOne(w, "SELECT COUNT(*) AS n FROM door_entries WHERE public_ref = 'exr_r3stale'").n === 1,
+      'an unauthenticated call runs no sweep (the stale mint survives)');
+    const unknown = await w.call('GET', '/api/v1/doors/bogus/extra', { key: KEY.owner_bot });
+    assert(unknown.status === 404, 'the unknown path 404s, got ' + unknown.status);
+    assert(sqlOne(w, "SELECT COUNT(*) AS n FROM door_entries WHERE public_ref = 'exr_r3stale'").n === 1,
+      'an unknown path runs no sweep even when authenticated');
+    await w.call('GET', '/api/v1/doors', { key: KEY.borrower_bot });
+    assert(sqlOne(w, "SELECT COUNT(*) AS n FROM door_entries WHERE public_ref = 'exr_r3stale'").n === 0,
+      'an authenticated call on a known route runs the sweep (retention deletes the stale mint)');
+  });
+
+  await section('R3 door idempotency placeholders expire', async () => {
+    const w = await makeWorld();
+    establishOperator(w, 1, 'op_owner');
+    const listing = await makeLiveListing(w, 'owner_bot', { title: 'TTL door service' });
+    const body = { listing_ref: listing.ref, slug: 'ttl-door', entry_url: 'https://doors.example.com/entry', entry_mode: 'grant', session_max_minutes: 60, terms_ack: true };
+    const sorted = { entry_mode: body.entry_mode, entry_url: body.entry_url, listing_ref: body.listing_ref, session_max_minutes: body.session_max_minutes, slug: body.slug, terms_ack: body.terms_ack };
+    const hash = await sha256hex(JSON.stringify(sorted));
+    const staleAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    w.db.prepare("INSERT INTO exchange_idempotency (actor_agent_id, operation, target_ref, idempotency_key, payload_hash, response_status, response_body, created_at) VALUES (1, 'door.create', ?, 'door-ttl-stale', ?, 0, '', ?)")
+      .run(listing.ref, hash, staleAt);
+    const landed = await w.call('POST', '/api/v1/doors', { key: KEY.owner_bot, idem: 'door-ttl-stale', body });
+    assert(landed.status === 201, 'a stale door placeholder frees its key and the create lands, got ' + landed.status + ' ' + landed.text);
+    const listing2 = await makeLiveListing(w, 'owner_bot', { title: 'TTL door service two' });
+    const body2 = { listing_ref: listing2.ref, slug: 'ttl-door-2', entry_url: 'https://doors.example.com/entry', entry_mode: 'grant', session_max_minutes: 60, terms_ack: true };
+    const sorted2 = { entry_mode: body2.entry_mode, entry_url: body2.entry_url, listing_ref: body2.listing_ref, session_max_minutes: body2.session_max_minutes, slug: body2.slug, terms_ack: body2.terms_ack };
+    const hash2 = await sha256hex(JSON.stringify(sorted2));
+    w.db.prepare("INSERT INTO exchange_idempotency (actor_agent_id, operation, target_ref, idempotency_key, payload_hash, response_status, response_body, created_at) VALUES (1, 'door.create', ?, 'door-ttl-fresh', ?, 0, '', ?)")
+      .run(listing2.ref, hash2, new Date().toISOString());
+    const blocked = await w.call('POST', '/api/v1/doors', { key: KEY.owner_bot, idem: 'door-ttl-fresh', body: body2 });
+    assert(blocked.status === 409 && blocked.json.error === 'idempotency_conflict', 'a fresh door placeholder still reserves its key, got ' + blocked.status + ' ' + blocked.text);
+  });
+}
+
+
 await acceptance();
 await conditions();
 await fixtures();
 await gateRound2Doors();
+await gateRound3Doors();
 
 const failed = results.filter(([, s]) => s !== 'PASS');
 console.log('');
